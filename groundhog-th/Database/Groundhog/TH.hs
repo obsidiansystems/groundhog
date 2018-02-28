@@ -41,7 +41,7 @@ import Language.Haskell.TH.Quote
 import Control.Applicative
 import Control.Monad (forM, forM_, when, unless, liftM2)
 import Data.Char (isUpper, isLower, isSpace, isDigit, toUpper, toLower)
-import Data.List (nub, (\\))
+import Data.List (sort, group)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.String
 import Data.Text.Encoding (encodeUtf8)
@@ -292,10 +292,10 @@ mkFieldsForUniqueKey style dName uniqueKey cDef = zipWith (setSelector . findFie
   uniqueDef = findOne "unique" thUniqueName (thUniqueKeyName uniqueKey) $ thConstrUniques cDef
   setSelector f i = f {thExprName = mkExprSelectorName style dName (thUniqueKeyConstrName uniqueKey) (thFieldName f) i}
 
-notUniqueBy :: Eq b => (a -> b) -> [a] -> [b]
-notUniqueBy f xs = let xs' = map f xs in nub $ xs' \\ nub xs'
+notUniqueBy :: Ord b => (a -> b) -> [a] -> [b]
+notUniqueBy f xs = let xs' = map f xs in concatMap (take 1 . drop 1) . group . sort $ xs'
 
-assertUnique :: (Monad m, Eq b, Show b) => (a -> b) -> [a] -> String -> m ()
+assertUnique :: (Monad m, Ord b, Show b) => (a -> b) -> [a] -> String -> m ()
 assertUnique f xs what = case notUniqueBy f xs of
   [] -> return ()
   ys -> fail $ "All " ++ what ++ " must be unique: " ++ show ys

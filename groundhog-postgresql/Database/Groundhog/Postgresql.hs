@@ -50,6 +50,11 @@ import Data.Maybe (fromJust, fromMaybe, isJust, mapMaybe)
 import Data.Monoid
 import Data.Pool
 import Data.Time.LocalTime (localTimeToUTC, utc)
+import qualified Data.Map as Map
+import Data.Map (Map)
+import qualified Data.Set as Set
+import Data.Set (Set)
+import Data.Text (Text)
 
 -- typical operations for connection: OPEN, BEGIN, COMMIT, ROLLBACK, CLOSE
 newtype Postgresql = Postgresql PG.Connection
@@ -72,6 +77,7 @@ instance FloatingSqlDb Postgresql where
 
 instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (DbPersist Postgresql m) where
   type PhantomDb (DbPersist Postgresql m) = Postgresql
+  type TableAnalysis (DbPersist Postgresql m) = (Map QualifiedName (Map String (Set (Maybe String, String))))
   insert v = insert' v
   insert_ v = insert_' v
   insertBy u v = H.insertBy renderConfig queryRaw' True u v
@@ -89,7 +95,7 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (Db
   count cond = H.count renderConfig queryRaw' cond
   countAll fakeV = H.countAll renderConfig queryRaw' fakeV
   project p options = H.project renderConfig queryRaw' preColumns "" p options
-  migrate fakeV = migrate' fakeV
+  migrate tableInfo fakeV = migrate' tableInfo fakeV
 
   executeRaw _ query ps = executeRaw' (fromString query) ps
   queryRaw _ query ps f = queryRaw' (fromString query) ps f
@@ -102,6 +108,7 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => SchemaAnalyzer (Db
   getCurrentSchema = queryRaw' "SELECT current_schema()" [] (fmap (>>= fst . fromPurePersistValues proxy))
   listTables schema = queryRaw' "SELECT table_name FROM information_schema.tables WHERE table_schema=coalesce(?,current_schema())" [toPrimitivePersistValue proxy schema] (mapAllRows $ return . fst . fromPurePersistValues proxy)
   listTableTriggers name = queryRaw' "SELECT trigger_name FROM information_schema.triggers WHERE event_object_schema=coalesce(?,current_schema()) AND event_object_table=?" (toPurePersistValues proxy name []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+  getTableAnalysis = getTableAnalysis'
   analyzeTable = analyzeTable'
   analyzeTrigger name = do
     x <- queryRaw' "SELECT action_statement FROM information_schema.triggers WHERE trigger_schema=coalesce(?,current_schema()) AND trigger_name=?" (toPurePersistValues proxy name []) id
@@ -124,7 +131,8 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => SchemaAnalyzer (Db
       []  -> Nothing
       ((_, (ret, src)):_) -> Just $ (Just $ map read' args, Just $ read' ret, src) where
         args = mapMaybe (\(typ, arr) -> fmap (\typ' -> (typ', arr)) typ) $ map fst result
-  getMigrationPack = fmap (migrationPack . fromJust) getCurrentSchema
+  getMigrationPack tableInfo = do
+    fmap (migrationPack tableInfo . fromJust) getCurrentSchema
 
 withPostgresqlPool :: (MonadBaseControl IO m, MonadIO m)
                    => String -- ^ connection string
@@ -290,20 +298,23 @@ toEntityPersistValues' = liftM ($ []) . toEntityPersistValues
 
 --- MIGRATION
 
-migrate' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) => v -> Migration (DbPersist Postgresql m)
-migrate' v = do
-  migPack <- lift $ getMigrationPack
-  migrateRecursively (migrateSchema migPack) (migrateEntity migPack) (migrateList migPack) v
+migrate' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) => TableAnalysis (DbPersist Postgresql m) -> v -> Migration (DbPersist Postgresql m)
+migrate' tableInfo v = do
+  migPack <- lift $ getMigrationPack tableInfo
+  migrateRecursively (migrateSchema migPack) (migrateEntity tableInfo migPack) (migrateList tableInfo migPack) v
 
-migrationPack :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => String -> GM.MigrationPack (DbPersist Postgresql m)
-migrationPack currentSchema = GM.MigrationPack
+migrationPack :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
+              => TableAnalysis (DbPersist Postgresql m)
+              -> String
+              -> GM.MigrationPack (DbPersist Postgresql m)
+migrationPack tableInfo currentSchema = GM.MigrationPack
   compareTypes
   (compareRefs currentSchema)
   compareUniqs
   compareDefaults
   migTriggerOnDelete
   migTriggerOnUpdate
-  GM.defaultMigConstr
+  (GM.defaultMigConstr tableInfo)
   escape
   "BIGSERIAL PRIMARY KEY UNIQUE"
   mainTableId
@@ -386,9 +397,19 @@ migTriggerOnUpdate tName dels = forM dels $ \(fieldName, del) -> do
             -- this can happen when an ephemeral field was added or removed.
             else [DropTrigger trigName tName, addTrigger])
   return (trigExisted, funcMig ++ trigMig)
-  
-analyzeTable' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> DbPersist Postgresql m (Maybe TableInfo)
-analyzeTable' name = do
+
+getTableAnalysis' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m (TableAnalysis (DbPersist Postgresql m))
+getTableAnalysis' = do
+  let constraintQuery = "SELECT nr.nspname, r.relname, c.contype, c.conname, a.attname from pg_class r LEFT JOIN pg_namespace nr ON nr.oid = r.relnamespace LEFT JOIN pg_attribute a ON a.attrelid = r.oid, pg_constraint c LEFT JOIN pg_namespace nc ON nc.oid = c.connamespace, pg_depend d WHERE d.classid = 'pg_constraint'::regclass::oid AND d.refobjid = r.oid AND d.objid = c.oid AND d.refobjsubid = a.attnum"
+  tableInfo <- queryRaw' constraintQuery (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+  return . Map.fromListWith (Map.unionWith Set.union) $
+    [((nspname,relname), Map.singleton contype (Set.singleton (conname, attname))) | (nspname, relname, contype, conname, attname) <- tableInfo]
+
+analyzeTable' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
+              => TableAnalysis (DbPersist Postgresql m)
+              -> QualifiedName
+              -> DbPersist Postgresql m (Maybe TableInfo)
+analyzeTable' info name = do
   table <- queryRaw' "SELECT * FROM information_schema.tables WHERE table_schema = coalesce(?, current_schema()) AND table_name = ?" (toPurePersistValues proxy name []) id
   case table of
     Just _ -> do
@@ -401,13 +422,24 @@ analyzeTable' name = do
 \  LEFT JOIN pg_catalog.pg_type te ON te.oid = t.typelem\
 \  WHERE c.table_schema = coalesce(?, current_schema()) AND c.table_name=?\
 \  ORDER BY c.ordinal_position"
-
-      cols <- queryRaw' colQuery (toPurePersistValues proxy name []) (mapAllRows $ return . getColumn . fst . fromPurePersistValues proxy)
-      let constraintQuery = "SELECT u.constraint_name, u.column_name FROM information_schema.table_constraints tc INNER JOIN information_schema.constraint_column_usage u ON tc.constraint_catalog=u.constraint_catalog AND tc.constraint_schema=u.constraint_schema AND tc.constraint_name=u.constraint_name WHERE tc.constraint_type=? AND tc.table_schema=coalesce(?,current_schema()) AND u.table_name=? ORDER BY u.constraint_name, u.column_name"
-      
-      uniqConstraints <- queryRaw' constraintQuery (toPurePersistValues proxy ("UNIQUE" :: String, name) []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
-      uniqPrimary <- queryRaw' constraintQuery (toPurePersistValues proxy ("PRIMARY KEY" :: String, name) []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+      curSchemas <- queryRaw' "SELECT current_schema()" (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+      let curSchema = case curSchemas of
+            [] -> error "Database.Groundhog.Postgresql.analyzeTable': \"SELECT current_schema()\" didn't return any rows."
+            (x:_) -> x
+          name' = case name of
+            (Nothing, nameTable) -> (Just curSchema, nameTable)
+            (Just _, _) -> name
+          mTableInfo = Map.lookup name' info
+          uniqConstraints = fromMaybe [] $ do
+            tableInfo <- mTableInfo
+            uniqs <- Map.lookup "u" tableInfo
+            return (Set.toList uniqs)
+          uniqPrimary = fromMaybe [] $ do
+            tableInfo <- mTableInfo
+            primary <- Map.lookup "p" tableInfo
+            return (Set.toList primary)
       -- indexes with system columns like oid are omitted
+      cols <- queryRaw' colQuery (toPurePersistValues proxy name' []) (mapAllRows $ return . getColumn . fst . fromPurePersistValues proxy)
       let indexQuery = "WITH indexes as (\
 \SELECT ic.oid, ic.relname,\
 \    ta.attnum, ta.attname, pg_get_indexdef(i.indexrelid, ia.attnum, true) as expr\
@@ -436,7 +468,7 @@ analyzeTable' name = do
       let uniqs = mkUniqs UniqueConstraint (map (second Left) uniqConstraints)
                ++ mkUniqs UniqueIndex (map (second $ \(col, expr) -> maybe (Right expr) Left col) uniqIndexes)
                ++ mkUniqs (UniquePrimary isAutoincremented) (map (second Left) uniqPrimary)
-      references <- analyzeTableReferences name
+      references <- analyzeTableReferences name'
       return $ Just $ TableInfo cols uniqs references
     Nothing -> return Nothing
 
@@ -552,7 +584,7 @@ showAlterTable table (AddReference (Reference tName columns onDelete onUpdate)) 
   (our, foreign) = f *** f $ unzip columns
   f = intercalate ", " . map escape
 showAlterTable table (DropReference name) = [(False, defaultPriority,
-    "ALTER TABLE " ++ table ++ " DROP CONSTRAINT " ++ name)]
+    "ALTER TABLE " ++ table ++ " DROP CONSTRAINT " ++ escape name)]
 
 showAlterColumn :: String -> String -> AlterColumn -> (Bool, Int, String)
 showAlterColumn table n (Type t) = (False, defaultPriority, concat
