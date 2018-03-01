@@ -5,6 +5,7 @@ module Database.Groundhog.Postgresql
     , createPostgresqlPool
     , runDbConn
     , Postgresql(..)
+    , PgTableAnalysis(..)
     , module Database.Groundhog
     , module Database.Groundhog.Generic.Sql.Functions
     , explicitType
@@ -75,9 +76,18 @@ instance FloatingSqlDb Postgresql where
   log' x = mkExpr $ function "ln" [toExpr x]
   logBase' b x = log (liftExpr x) / log (liftExpr b)
 
+
+data PgTableAnalysis = PgTableAnalysis
+  { _pgTableAnalysis_tables :: Set QualifiedName
+  , _pgTableAnalysis_constraints :: Map QualifiedName (Map String (Set (Maybe String, String)))
+  , _pgTableAnalysis_columns :: Map QualifiedName [Column]
+  , _pgTableAnalysis_indices :: Map QualifiedName (Set (Maybe String, QualifiedName))
+  , _pgTableAnalysis_references :: Map QualifiedName (Set (String, ((QualifiedName, String, String), (String, String))))
+  } deriving (Eq, Show)
+
 instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (DbPersist Postgresql m) where
   type PhantomDb (DbPersist Postgresql m) = Postgresql
-  type TableAnalysis (DbPersist Postgresql m) = (Map QualifiedName (Map String (Set (Maybe String, String))))
+  type TableAnalysis (DbPersist Postgresql m) = PgTableAnalysis
   insert v = insert' v
   insert_ v = insert_' v
   insertBy u v = H.insertBy renderConfig queryRaw' True u v
@@ -398,69 +408,88 @@ migTriggerOnUpdate tName dels = forM dels $ \(fieldName, del) -> do
             else [DropTrigger trigName tName, addTrigger])
   return (trigExisted, funcMig ++ trigMig)
 
-getTableAnalysis' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m (TableAnalysis (DbPersist Postgresql m))
+getTableAnalysis' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m PgTableAnalysis
 getTableAnalysis' = do
+  tables <- queryRaw' "SELECT table_schema, table_name FROM information_schema.tables" (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
   let constraintQuery = "SELECT nr.nspname, r.relname, c.contype, c.conname, a.attname from pg_class r LEFT JOIN pg_namespace nr ON nr.oid = r.relnamespace LEFT JOIN pg_attribute a ON a.attrelid = r.oid, pg_constraint c LEFT JOIN pg_namespace nc ON nc.oid = c.connamespace, pg_depend d WHERE d.classid = 'pg_constraint'::regclass::oid AND d.refobjid = r.oid AND d.objid = c.oid AND d.refobjsubid = a.attnum"
+      colQuery = "SELECT c.table_schema, c.table_name, c.column_name, c.is_nullable, c.udt_name, c.column_default, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.datetime_precision, c.interval_type, a.attndims AS array_dims, te.typname AS array_elem\
+               \  FROM pg_catalog.pg_attribute a\
+               \  INNER JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid\
+               \  INNER JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace\
+               \  INNER JOIN information_schema.columns c ON c.column_name = a.attname AND c.table_name = cl.relname AND c.table_schema = n.nspname\
+               \  INNER JOIN pg_catalog.pg_type t ON t.oid = a.atttypid\
+               \  LEFT JOIN pg_catalog.pg_type te ON te.oid = t.typelem\
+               \  ORDER BY c.ordinal_position"
   tableInfo <- queryRaw' constraintQuery (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
-  return . Map.fromListWith (Map.unionWith Set.union) $
-    [((nspname,relname), Map.singleton contype (Set.singleton (conname, attname))) | (nspname, relname, contype, conname, attname) <- tableInfo]
+  columnInfo <- queryRaw' colQuery (toPurePersistValues proxy () []) (mapAllRows $ return . (\(n,t,c) -> (n,t,getColumn c)) . fst . fromPurePersistValues proxy)
+  let indexQuery = "WITH indexes as (\
+                   \SELECT sch.nspname, tc.relname as tablename, ic.oid, ic.relname,\
+                   \    ta.attnum, ta.attname, pg_get_indexdef(i.indexrelid, ia.attnum, true) as expr\
+                   \  FROM pg_catalog.pg_index i\
+                   \  INNER JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid\
+                   \  INNER JOIN pg_catalog.pg_class tc ON i.indrelid = tc.oid\
+                   \  INNER JOIN pg_catalog.pg_attribute ia ON ia.attrelid=ic.oid\
+                   \  LEFT JOIN pg_catalog.pg_attribute ta ON ta.attrelid=tc.oid AND ta.attnum = i.indkey[ia.attnum-1] AND NOT ta.attisdropped\
+                   \  INNER JOIN pg_namespace sch ON sch.oid = tc.relnamespace\
+                   \  WHERE ic.oid NOT IN (SELECT conindid FROM pg_catalog.pg_constraint)\
+                   \    AND NOT i.indisprimary\
+                   \    AND i.indisunique\
+                   \  ORDER BY ic.relname, ia.attnum)\
+                   \SELECT i.nspname, i.tablename, i.relname, i.attname, i.expr\
+                   \  FROM indexes i\
+                   \  INNER JOIN (SELECT oid FROM indexes\
+                   \    GROUP BY oid\
+                   \    HAVING every(attnum > 0 OR attnum IS NULL)) non_system ON i.oid = non_system.oid"
+  indexInfo <- queryRaw' indexQuery (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+  let referencesQuery = "SELECT sch_child.nspname, cl_child.relname, c.conname, sch_parent.nspname, cl_parent.relname, c. confdeltype, c.confupdtype, a_child.attname AS child, a_parent.attname AS parent FROM\
+                     \  (SELECT r.conrelid, r.confrelid, unnest(r.conkey) AS conkey, unnest(r.confkey) AS confkey, r.conname, r.confupdtype, r.confdeltype\
+                     \    FROM pg_catalog.pg_constraint r WHERE r.contype = 'f'\
+                     \  ) AS c\
+                     \  INNER JOIN pg_attribute a_parent ON a_parent.attnum = c.confkey AND a_parent.attrelid = c.confrelid\
+                     \  INNER JOIN pg_class cl_parent ON cl_parent.oid = c.confrelid\
+                     \  INNER JOIN pg_namespace sch_parent ON sch_parent.oid = cl_parent.relnamespace\
+                     \  INNER JOIN pg_attribute a_child ON a_child.attnum = c.conkey AND a_child.attrelid = c.conrelid\
+                     \  INNER JOIN pg_class cl_child ON cl_child.oid = c.conrelid\
+                     \  INNER JOIN pg_namespace sch_child ON sch_child.oid = cl_child.relnamespace\
+                     \  ORDER BY c.conname"
+  referencesInfo <- queryRaw' referencesQuery (toPurePersistValues proxy () []) $ mapAllRows (return . fst . fromPurePersistValues proxy)
+  return $ PgTableAnalysis
+    { _pgTableAnalysis_tables = Set.fromList tables
+    , _pgTableAnalysis_columns = Map.fromListWith (++) [((nspname, relname),[col]) | (nspname, relname, col) <- columnInfo]
+    , _pgTableAnalysis_constraints = Map.fromListWith (Map.unionWith Set.union) $
+        [((nspname,relname), Map.singleton contype (Set.singleton (conname, attname))) | (nspname, relname, contype, conname, attname) <- tableInfo]
+    , _pgTableAnalysis_indices = Map.fromListWith Set.union [((nspname, relname), Set.singleton idx) | (nspname, relname, idx) <- indexInfo]
+    , _pgTableAnalysis_references = Map.fromListWith Set.union [((nspname, relname), Set.singleton ref) | (nspname, relname, ref) <- referencesInfo]
+    }
 
 analyzeTable' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
               => TableAnalysis (DbPersist Postgresql m)
               -> QualifiedName
               -> DbPersist Postgresql m (Maybe TableInfo)
-analyzeTable' info name = do
-  table <- queryRaw' "SELECT * FROM information_schema.tables WHERE table_schema = coalesce(?, current_schema()) AND table_name = ?" (toPurePersistValues proxy name []) id
-  case table of
-    Just _ -> do
-      let colQuery = "SELECT c.column_name, c.is_nullable, c.udt_name, c.column_default, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.datetime_precision, c.interval_type, a.attndims AS array_dims, te.typname AS array_elem\
-\  FROM pg_catalog.pg_attribute a\
-\  INNER JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid\
-\  INNER JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace\
-\  INNER JOIN information_schema.columns c ON c.column_name = a.attname AND c.table_name = cl.relname AND c.table_schema = n.nspname\
-\  INNER JOIN pg_catalog.pg_type t ON t.oid = a.atttypid\
-\  LEFT JOIN pg_catalog.pg_type te ON te.oid = t.typelem\
-\  WHERE c.table_schema = coalesce(?, current_schema()) AND c.table_name=?\
-\  ORDER BY c.ordinal_position"
-      curSchemas <- queryRaw' "SELECT current_schema()" (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
-      let curSchema = case curSchemas of
-            [] -> error "Database.Groundhog.Postgresql.analyzeTable': \"SELECT current_schema()\" didn't return any rows."
-            (x:_) -> x
-          name' = case name of
-            (Nothing, nameTable) -> (Just curSchema, nameTable)
-            (Just _, _) -> name
-          mTableInfo = Map.lookup name' info
+analyzeTable' info rawName = do
+  curSchemas <- queryRaw' "SELECT current_schema()" (toPurePersistValues proxy () []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+  let curSchema = case curSchemas of
+        [] -> error "Database.Groundhog.Postgresql.analyzeTable': \"SELECT current_schema()\" didn't return any rows."
+        (x:_) -> x
+      name = case rawName of
+        (Nothing, nameTable) -> (Just curSchema, nameTable)
+        (Just _, _) -> rawName
+  case Set.member name (_pgTableAnalysis_tables info) of
+    True -> do
+      let mTableConstraintInfo = Map.lookup name (_pgTableAnalysis_constraints info)
           uniqConstraints = fromMaybe [] $ do
-            tableInfo <- mTableInfo
+            tableInfo <- mTableConstraintInfo
             uniqs <- Map.lookup "u" tableInfo
             return (Set.toList uniqs)
           uniqPrimary = fromMaybe [] $ do
-            tableInfo <- mTableInfo
+            tableInfo <- mTableConstraintInfo
             primary <- Map.lookup "p" tableInfo
             return (Set.toList primary)
       -- indexes with system columns like oid are omitted
-      cols <- queryRaw' colQuery (toPurePersistValues proxy name' []) (mapAllRows $ return . getColumn . fst . fromPurePersistValues proxy)
-      let indexQuery = "WITH indexes as (\
-\SELECT ic.oid, ic.relname,\
-\    ta.attnum, ta.attname, pg_get_indexdef(i.indexrelid, ia.attnum, true) as expr\
-\  FROM pg_catalog.pg_index i\
-\  INNER JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid\
-\  INNER JOIN pg_catalog.pg_class tc ON i.indrelid = tc.oid\
-\  INNER JOIN pg_catalog.pg_attribute ia ON ia.attrelid=ic.oid\
-\  LEFT JOIN pg_catalog.pg_attribute ta ON ta.attrelid=tc.oid AND ta.attnum = i.indkey[ia.attnum-1] AND NOT ta.attisdropped\
-\  INNER JOIN pg_namespace sch ON sch.oid = tc.relnamespace\
-\  WHERE sch.nspname = coalesce(?, current_schema())\
-\    AND tc.relname = ?\
-\    AND ic.oid NOT IN (SELECT conindid FROM pg_catalog.pg_constraint)\
-\    AND NOT i.indisprimary\
-\    AND i.indisunique\
-\  ORDER BY ic.relname, ia.attnum)\
-\SELECT i.relname, i.attname, i.expr\
-\  FROM indexes i\
-\  INNER JOIN (SELECT oid FROM indexes\
-\    GROUP BY oid\
-\    HAVING every(attnum > 0 OR attnum IS NULL)) non_system ON i.oid = non_system.oid"
-      uniqIndexes <- queryRaw' indexQuery (toPurePersistValues proxy name []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+          cols = Map.findWithDefault [] name (_pgTableAnalysis_columns info)
+          uniqIndexes = fromMaybe [] $ do
+            indexInfo <- Map.lookup name (_pgTableAnalysis_indices info)
+            return (Set.toList indexInfo)
       let mkUniqs typ = map (\us -> UniqueDef (fst $ head us) typ (map snd us)) . groupBy ((==) `on` fst)
           isAutoincremented = case filter (\c -> colName c `elem` map snd uniqPrimary) cols of
                                 [c] -> colType c `elem` [DbInt32, DbInt64] && maybe False ("nextval" `isPrefixOf`) (colDefault c)
@@ -468,29 +497,19 @@ analyzeTable' info name = do
       let uniqs = mkUniqs UniqueConstraint (map (second Left) uniqConstraints)
                ++ mkUniqs UniqueIndex (map (second $ \(col, expr) -> maybe (Right expr) Left col) uniqIndexes)
                ++ mkUniqs (UniquePrimary isAutoincremented) (map (second Left) uniqPrimary)
-      references <- analyzeTableReferences name'
+      references <- analyzeTableReferences info name
       return $ Just $ TableInfo cols uniqs references
-    Nothing -> return Nothing
+    False -> return Nothing
 
 getColumn :: ((String, String, String, Maybe String), (Maybe Int, Maybe Int, Maybe Int, Maybe Int, Maybe String), (Int, Maybe String)) -> Column
 getColumn ((column_name, is_nullable, udt_name, d), modifiers, arr_info) = Column column_name (is_nullable == "YES") t d where
   t = readSqlType udt_name modifiers arr_info
 
-analyzeTableReferences :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> DbPersist Postgresql m [(Maybe String, Reference)]
-analyzeTableReferences tName = do
-  let sql = "SELECT c.conname, sch_parent.nspname, cl_parent.relname, c. confdeltype, c.confupdtype, a_child.attname AS child, a_parent.attname AS parent FROM\
-\  (SELECT r.conrelid, r.confrelid, unnest(r.conkey) AS conkey, unnest(r.confkey) AS confkey, r.conname, r.confupdtype, r.confdeltype\
-\    FROM pg_catalog.pg_constraint r WHERE r.contype = 'f'\
-\  ) AS c\
-\  INNER JOIN pg_attribute a_parent ON a_parent.attnum = c.confkey AND a_parent.attrelid = c.confrelid\
-\  INNER JOIN pg_class cl_parent ON cl_parent.oid = c.confrelid\
-\  INNER JOIN pg_namespace sch_parent ON sch_parent.oid = cl_parent.relnamespace\
-\  INNER JOIN pg_attribute a_child ON a_child.attnum = c.conkey AND a_child.attrelid = c.conrelid\
-\  INNER JOIN pg_class cl_child ON cl_child.oid = c.conrelid\
-\  INNER JOIN pg_namespace sch_child ON sch_child.oid = cl_child.relnamespace\
-\  WHERE sch_child.nspname = coalesce(?, current_schema()) AND cl_child.relname = ?\
-\  ORDER BY c.conname"
-  x <- queryRaw' sql (toPurePersistValues proxy tName []) $ mapAllRows (return . fst . fromPurePersistValues proxy)
+analyzeTableReferences :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PgTableAnalysis -> QualifiedName -> DbPersist Postgresql m [(Maybe String, Reference)]
+analyzeTableReferences info tName = do
+  let x = fromMaybe [] $ do
+        refs <- Map.lookup tName (_pgTableAnalysis_references info)
+        return (Set.toList refs)
   -- (refName, ((parentTableSchema, parentTable, onDelete, onUpdate), (childColumn, parentColumn)))
   let mkReference xs = (Just refName, Reference parentTable pairs (mkAction onDelete) (mkAction onUpdate)) where
         pairs = map (snd . snd) xs
