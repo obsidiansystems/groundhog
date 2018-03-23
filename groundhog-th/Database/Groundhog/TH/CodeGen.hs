@@ -710,8 +710,8 @@ mkMigrateFunction :: String -> [THEntityDef] -> Q [Dec]
 mkMigrateFunction name defs = do
   let (normal, polymorhpic) = partition (null . thTypeParams) defs
   forM_ polymorhpic $ \def -> reportWarning $ "Datatype " ++ show (thDataName def) ++ " will not be migrated automatically by function " ++ name ++ " because it has type parameters"
-  let body = doE $ map (\def -> noBindS [| migrate (undefined :: $(conT $ thDataName def)) |]) normal
-  sig <- sigD (mkName name) [t| forall m. PersistBackend m => Migration m |]
+  let body = lamE [varP (mkName "tableInfo")] . doE $ map (\def -> noBindS [| migrate tableInfo (undefined :: $(conT $ thDataName def)) |]) normal
+  sig <- sigD (mkName name) [t| forall m. PersistBackend m => TableAnalysis m -> Migration m |]
   func <- funD (mkName name) [clause [] (normalB body) []]
   return [sig, func]
 

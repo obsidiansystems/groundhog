@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecordWildCards, TypeFamilies #-}
 -- | This helper module is intended for use by the backend creators
 module Database.Groundhog.Generic.Migration
   ( Column(..)
@@ -191,8 +191,8 @@ migrateSchema MigrationPack{..} schema = do
     then Right []
     else showAlterDb $ CreateSchema schema False
 
-migrateEntity :: (SchemaAnalyzer m, PersistBackend m) => MigrationPack m -> EntityDef -> m SingleMigration
-migrateEntity m@MigrationPack{..} e = do
+migrateEntity :: (SchemaAnalyzer m, PersistBackend m) => TableAnalysis m -> MigrationPack m -> EntityDef -> m SingleMigration
+migrateEntity tableInfo m@MigrationPack{..} e = do
   autoKeyType <- fmap getAutoKeyType phantomDb
   let name = entityName e
       constrs = constructors e
@@ -201,14 +201,14 @@ migrateEntity m@MigrationPack{..} e = do
 
   if isSimple constrs
     then do
-      x <- analyzeTable (entitySchema e, name)
+      x <- analyzeTable tableInfo (entitySchema e, name)
       -- check whether the table was created for multiple constructors before
       case x of
         Just old | null $ getAlters m old expectedMainStructure -> return $ Left
           ["Datatype with multiple constructors was truncated to one constructor. Manual migration required. Datatype: " ++ name]
         _ -> liftM snd $ migConstr m e $ head constrs
     else do
-      mainStructure <- analyzeTable (entitySchema e, name)
+      mainStructure <- analyzeTable tableInfo (entitySchema e, name)
       let constrTable c = name ++ [delim] ++ constrName c
       res <- mapM (migConstr m e) constrs
       return $ case mainStructure of
@@ -229,8 +229,8 @@ migrateEntity m@MigrationPack{..} e = do
                in mergeMigrations $ Right updateDiscriminators: map snd res
           else Left ["Unexpected structure of main table for Datatype: " ++ name ++ ". Table info: " ++ show mainStructure']
 
-migrateList :: (SchemaAnalyzer m, PersistBackend m) => MigrationPack m -> DbType -> m SingleMigration
-migrateList m@MigrationPack{..} (DbList mainName t) = do
+migrateList :: (SchemaAnalyzer m, PersistBackend m) => TableAnalysis m -> MigrationPack m -> DbType -> m SingleMigration
+migrateList tableInfo m@MigrationPack{..} (DbList mainName t) = do
   autoKeyType <- fmap getAutoKeyType phantomDb
   let valuesName = mainName ++ delim : "values"
       (valueCols, valueRefs) = (($ []) . mkColumns autoKeyType) &&& mkReferences autoKeyType $ ("value", t)
@@ -242,8 +242,8 @@ migrateList m@MigrationPack{..} (DbList mainName t) = do
       valueColumns = Column "id" False autoKeyType Nothing : Column "ord" False DbInt32 Nothing : valueCols
       valuesQuery = "CREATE TABLE " ++ escape valuesName ++ " (" ++ intercalate ", " (map showColumn valueColumns ++ addInCreate) ++ ")"
   -- TODO: handle case when outer entity has a schema
-  mainStructure <- analyzeTable (Nothing, mainName)
-  valuesStructure <- analyzeTable (Nothing, valuesName)
+  mainStructure <- analyzeTable tableInfo (Nothing, mainName)
+  valuesStructure <- analyzeTable tableInfo (Nothing, valuesName)
   let triggerMain = []
   (_, triggerValues) <- migTriggerOnDelete (Nothing, valuesName) $ mkDeletes escape ("value", t)
   return $ case (mainStructure, valuesStructure) of
@@ -258,7 +258,7 @@ migrateList m@MigrationPack{..} (DbList mainName t) = do
       in if null errors then Right [] else Left errors
     (_, Nothing) -> Left ["Found orphan main list table " ++ mainName]
     (Nothing, _) -> Left ["Found orphan list values table " ++ valuesName]
-migrateList _ t = fail $ "migrateList: expected DbList, got " ++ show t
+migrateList _ _ t = fail $ "migrateList: expected DbList, got " ++ show t
 
 getAlters :: MigrationPack m
           -> TableInfo -- ^ From database
@@ -319,13 +319,13 @@ dropUnique (UniqueDef name typ _) = (case typ of
   UniquePrimary _ -> DropConstraint name') where
   name' = fromMaybe (error $ "dropUnique: constraint which should be dropped does not have a name") name
   
-defaultMigConstr :: (SchemaAnalyzer m, PersistBackend m) => MigrationPack m -> EntityDef -> ConstructorDef -> m (Bool, SingleMigration)
-defaultMigConstr m@MigrationPack{..} e constr = do
+defaultMigConstr :: (SchemaAnalyzer m, PersistBackend m) => TableAnalysis m -> MigrationPack m -> EntityDef -> ConstructorDef -> m (Bool, SingleMigration)
+defaultMigConstr tableInfo m@MigrationPack{..} e constr = do
   let simple = isSimple $ constructors e
       name = entityName e
       qualifiedCName = (entitySchema e, if simple then name else name ++ [delim] ++ constrName constr)
   autoKeyType <- fmap getAutoKeyType phantomDb
-  tableStructure <- analyzeTable qualifiedCName
+  tableStructure <- analyzeTable tableInfo qualifiedCName
   let dels = concatMap (mkDeletes escape) $ constrParams constr
   (triggerExisted, delTrigger) <- migTriggerOnDelete qualifiedCName dels
   updTriggers <- liftM (concatMap snd) $ migTriggerOnUpdate qualifiedCName dels
@@ -397,10 +397,12 @@ class (Applicative m, Monad m) => SchemaAnalyzer m where
              -> m [String]
   listTableTriggers :: QualifiedName -- ^ Qualified table name
                     -> m [String]
-  analyzeTable :: QualifiedName -- ^ Qualified table name
+  getTableAnalysis :: m (TableAnalysis m)
+  analyzeTable :: TableAnalysis m
+               -> QualifiedName -- ^ Qualified table name
                -> m (Maybe TableInfo)
   analyzeTrigger :: QualifiedName -- ^ Qualified trigger name
                  -> m (Maybe String)
   analyzeFunction :: QualifiedName -- ^ Qualified function name
                   -> m (Maybe (Maybe [DbTypePrimitive], Maybe DbTypePrimitive, String)) -- ^ Argument types, return type, and body
-  getMigrationPack :: m (MigrationPack m)
+  getMigrationPack :: TableAnalysis m -> m (MigrationPack m)
