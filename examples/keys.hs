@@ -1,7 +1,5 @@
 {-# LANGUAGE GADTs, TypeFamilies, TemplateHaskell, QuasiQuotes, FlexibleInstances, StandaloneDeriving #-}
-import Control.Monad
 import Control.Monad.IO.Class (liftIO)
-import Database.Groundhog.Core (UniqueMarker)
 import Database.Groundhog.TH
 import Database.Groundhog.Sqlite
 
@@ -63,7 +61,7 @@ main :: IO ()
 main = withSqliteConn ":memory:" $ runDbConn $ do
   let artists = [Artist "John Lennon", Artist "George Harrison"]
       imagineAlbum = Album "Imagine"
-  runMigration defaultMigrationLogger $ do
+  runMigration $ do
     migrate (undefined :: ArtistAlbum)
     migrate (undefined :: Track)
   mapM_ insert artists

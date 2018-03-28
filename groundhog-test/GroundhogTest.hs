@@ -1,8 +1,9 @@
-{-# LANGUAGE GADTs, TypeFamilies, TemplateHaskell, QuasiQuotes, RankNTypes, ScopedTypeVariables, FlexibleContexts, FlexibleInstances, StandaloneDeriving, CPP #-}
+{-# LANGUAGE GADTs, TypeFamilies, TemplateHaskell, QuasiQuotes, RankNTypes, ScopedTypeVariables, FlexibleContexts, FlexibleInstances, StandaloneDeriving, EmptyDataDecls, CPP #-}
 {-# OPTIONS_GHC -fno-warn-unused-do-bind #-}
 
 module GroundhogTest (
       testSelect
+    , testSelectDistinct
     , testCond
     , testArith
     , testProjectionSql
@@ -41,11 +42,15 @@ module GroundhogTest (
     , testAutoKeyField
     , testTime
     , testPrimitiveData
+    , testNoColumns
+    , testNoKeys
+    , testJSON
     , testMigrateOrphanConstructors
     , testSchemas
     , testFloating
     , testListTriggersOnDelete
     , testListTriggersOnUpdate
+    , testSchemaAnalysis
 #if WITH_SQLITE
     , testSchemaAnalysisSqlite
 #endif
@@ -53,6 +58,8 @@ module GroundhogTest (
     , testSchemaAnalysisPostgresql
     , testGeometry
     , testArrays
+    , testSelectDistinctOn
+    , testExpressionIndex
 #endif
 #if WITH_MYSQL
     , testSchemaAnalysisMySQL
@@ -61,14 +68,14 @@ module GroundhogTest (
 
 import qualified Control.Exception as E
 import Control.Exception.Base (SomeException)
-import Control.Monad (replicateM_, liftM, mapM_, forM_, (>=>), unless)
+import Control.Monad (liftM, forM_, unless)
 import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Logger (MonadLogger)
 import Control.Monad.Trans.Control (MonadBaseControl, control)
 import Database.Groundhog
 import Database.Groundhog.Core
 import Database.Groundhog.Generic
-import Database.Groundhog.Generic.Migration (SchemaAnalyzer(..))
+import Database.Groundhog.Generic.Migration
 import Database.Groundhog.Generic.Sql
 import Database.Groundhog.Generic.Sql.Functions
 import Database.Groundhog.TH
@@ -79,14 +86,18 @@ import Database.Groundhog.Sqlite
 import Database.Groundhog.Postgresql
 import Database.Groundhog.Postgresql.Array hiding (all, any, append)
 import qualified Database.Groundhog.Postgresql.Array as Arr
-import Database.Groundhog.Postgresql.Geometry hiding ((>>))
+import Database.Groundhog.Postgresql.Geometry hiding ((>>), (&&))
+import qualified Database.Groundhog.Postgresql.Geometry as Geo
 #endif
 #if WITH_MYSQL
 import Database.Groundhog.MySQL
 #endif
+import qualified Data.Aeson as A
 import Data.ByteString.Char8 (unpack)
+import Data.Function (on)
 import Data.Int
 import Data.List (intercalate, isInfixOf, sort)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map as Map
 import qualified Data.String.Utils as Utils
 import qualified Data.Time as Time
@@ -112,7 +123,9 @@ data InCurrentSchema = InCurrentSchema { inCurrentSchema :: Maybe (Key InAnother
 data InAnotherSchema = InAnotherSchema { inAnotherSchema :: Maybe (Key InCurrentSchema BackendSpecific) }
 data EnumTest = Enum1 | Enum2 | Enum3 deriving (Eq, Show, Enum)
 data ShowRead = ShowRead String Int deriving (Eq, Show, Read)
-
+data NoColumns = NoColumns deriving (Eq, Show)
+data NoKeys = NoKeys Int Int deriving (Eq, Show)
+data ExpressionIndex = ExpressionIndex { expressionIndex :: Int } deriving (Eq, Show)
 
 -- cannot use ordinary deriving because it runs before mkPersist and requires (Single String) to be an instance of PersistEntity
 deriving instance Eq Keys
@@ -180,10 +193,12 @@ mkPersist defaultCodegenConfig [groundhog|
     - name: UniqueKeySample
       uniques:
         - name: unique_key_one_column
-          type: primary
           fields: [uniqueKey1]
         - name: unique_key_two_columns
           fields: [uniqueKey2, uniqueKey3]
+        - name: unique_primary
+          type: primary
+          fields: [uniqueKey1, uniqueKey2]
 - entity: InCurrentSchema
 - entity: InAnotherSchema
   schema: myschema
@@ -191,6 +206,16 @@ mkPersist defaultCodegenConfig [groundhog|
   representation: enum
 - primitive: ShowRead
   representation: showread # by default
+- entity: NoColumns
+- entity: NoKeys
+  autoKey: null
+- entity: ExpressionIndex
+  constructors:
+    - name: ExpressionIndex
+      uniques:
+        - name: Expression_index
+          type: index
+          fields: [{expr: "(abs(\"expressionIndex\") + 1)" }]
 |]
 
 data HoldsUniqueKey = HoldsUniqueKey { foreignUniqueKey :: Key UniqueKeySample (Unique Unique_key_one_column) } deriving (Eq, Show)
@@ -208,9 +233,13 @@ mkPersist defaultCodegenConfig [groundhog|
 
 migr :: (PersistEntity v, PersistBackend m, MonadBaseControl IO m, MonadIO m) => v -> m ()
 migr v = do
-  runMigration silentMigrationLogger (migrate v)
-  m <- createMigration $ migrate v
-  [] @=? filter (/= Right []) (Map.elems m)
+  m1 <- createMigration $ migrate v
+  executeMigration m1
+  m2 <- createMigration $ migrate v
+  let afterMigration = filter (/= Right []) (Map.elems m2)
+  liftIO $ unless (null afterMigration) $
+    H.assertFailure $ ("first migration: " ++ show (Map.elems m1) ++ "\nsecond migration:" ++ show afterMigration)
+    
 
 (@=?) :: (Eq a, Show a, MonadBaseControl IO m, MonadIO m) => a -> a -> m ()
 expected @=? actual = liftIO $ expected H.@=? actual
@@ -295,31 +324,37 @@ testMaybe = do
   migr val
   Just val @=?? (insert val >>= get)
 
-testSelect :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db, QueryRaw db ~ Snippet db) => m ()
+testSelect :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db) => m ()
 testSelect = do
   migr (undefined :: Single (Int, String))
   let val1 = Single (5 :: Int, "abc")
   let val2 = Single (7 :: Int, "DEF")
   let val3 = Single (11 :: Int, "ghc")
-  k1 <- insert val1
-  k2 <- insert val2
-  k3 <- insert val3
-  vals1 <- select $ (SingleField ~> Tuple2_0Selector >. (5 :: Int)) `orderBy` [Asc (SingleField ~> Tuple2_1Selector)] `offsetBy` 1
-  [val3] @=? vals1
-  vals2 <- select $ (SingleField ~> Tuple2_0Selector >. (5 :: Int)) `orderBy` [Asc (SingleField ~> Tuple2_1Selector)] `limitTo` 1
-  [val2] @=? vals2
-  vals3 <- select $ (SingleField >=. (6 :: Int, "something") &&. SingleField ~> Tuple2_1Selector <. "ghc") `limitTo` 1
-  [val2] @=? vals3
-  vals4 <- select $ liftExpr (SingleField ~> Tuple2_0Selector) + 1 >. (10 :: Int)
-  [val3] @=? vals4
-  vals5 <- select $ (SingleField ~> Tuple2_1Selector) `like` "%E%"
-  [val2] @=? vals5
-  vals6 <- select $ lower (SingleField ~> Tuple2_1Selector) ==. "def"
-  [val2] @=? vals6
-  vals7 <- select $ ((SingleField ~> Tuple2_0Selector) `in_` [7 :: Int, 5]) `orderBy` [Asc (SingleField ~> Tuple2_0Selector)]
-  [val1, val2] @=? vals7
+  insert val1
+  insert val2
+  insert val3
+  [val3] @=?? (select $ (SingleField ~> Tuple2_0Selector >. (5 :: Int)) `orderBy` [Asc (SingleField ~> Tuple2_1Selector)] `offsetBy` 1)
+  [val2] @=?? (select $ (SingleField ~> Tuple2_0Selector >. (5 :: Int)) `orderBy` [Asc (SingleField ~> Tuple2_1Selector)] `limitTo` 1)
+  [val2] @=?? (select $ (SingleField >=. (6 :: Int, "something") &&. SingleField ~> Tuple2_1Selector <. "ghc") `limitTo` 1)
+  [val3] @=?? (select $ liftExpr (SingleField ~> Tuple2_0Selector) + 1 >. (10 :: Int))
+  [val2] @=?? (select $ (SingleField ~> Tuple2_1Selector) `like` "%E%")
+  [val2] @=?? (select $ lower (SingleField ~> Tuple2_1Selector) ==. "def")
+  [val1, val2] @=?? (select $ ((SingleField ~> Tuple2_0Selector) `in_` [7 :: Int, 5]) `orderBy` [Asc (SingleField ~> Tuple2_0Selector)])
+  [val1] @=?? (select $ CondEmpty `orderBy` [Asc SingleField] `limitTo` 1)
+  [val1] @=?? (select $ CondEmpty `orderBy` [Asc SingleField, Desc SingleField] `limitTo` 1)
+  ([] :: [Single (Int, String)]) @=?? (select $ Not CondEmpty)
 
-testArith :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db, QueryRaw db ~ Snippet db) => m ()
+testSelectDistinct :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
+testSelectDistinct = do
+  let val1 = Single (5 :: Int, "abc")
+      val2 = Single (6 :: Int, "def")
+  migr val1
+  insert val1
+  insert val1
+  insert val2
+  [val1, val2] @=?? (select $ distinct $ CondEmpty `orderBy` [Asc $ SingleField ~> Tuple2_0Selector])
+
+testArith :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db) => m ()
 testArith = do
   let val = Single (1 :: Int)
   migr val
@@ -329,7 +364,7 @@ testArith = do
   [(-6, -1)] @=?? project (quotRem (liftExpr SingleField - 20) 3) (AutoKeyField ==. k)
   [(-7, 2)] @=?? project (divMod (liftExpr SingleField - 20) 3) (AutoKeyField ==. k)
 
-testCond :: forall m db . (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db, QueryRaw db ~ Snippet db) => m ()
+testCond :: forall m db . (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db) => m ()
 testCond = do
   proxy <- phantomDb
   let rend :: forall r . Cond (PhantomDb m) r -> Maybe (RenderS (PhantomDb m) r)
@@ -640,7 +675,7 @@ testLongNames = do
   let val2 = Single [([""], Single "", 0 :: Int)]
   migr val2
   m2 <- createMigration (migrate val2)
-  executeMigration silentMigrationLogger m2
+  executeMigration m2
   -- this might fail because the constraint names are too long. They constraints are created successfully, but with stripped names. Then during the second migration the stripped names differ from expected and this leads to migration errors.
   [] @=? filter (/= Right []) (Map.elems m2)
 
@@ -697,7 +732,7 @@ testProjection = do
   result2 <- project Unique_key_two_columns ("" ==. "")
   [extractUnique uVal] @=? result2
 
-testProjectionSql :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db, QueryRaw db ~ Snippet db) => m ()
+testProjectionSql :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db) => m ()
 testProjectionSql = do
   let val = Single ("abc", 5 :: Int)
   migr val
@@ -746,14 +781,39 @@ testTime = do
   let val = Single (utcTime, dayTime, day, zonedTime)
   migr val
   k <- insert val
-  val' <- get k
-  Just val @=? val'
+  Just val @=?? get k
 
 testPrimitiveData :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
 testPrimitiveData = do
   let val = Single (Enum2, ShowRead "abc" 42)
   migr val
   Just val @=?? (insert val >>= get)
+
+testNoColumns :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
+testNoColumns = do
+  let val = NoColumns
+  migr val
+  k1 <- insert val
+  k2 <- insert val
+  [k1, k2] @=?? (project (AutoKeyField :: AutoKeyField NoColumns c) $ CondEmpty `orderBy` [Asc AutoKeyField])
+
+testNoKeys :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
+testNoKeys = do
+  let val = NoKeys 1 2
+  m <- fmap Map.elems $ createMigration $ migrate val
+  let queries = concat $ map (either (const "") (concat . map (\(_, _, q) -> q))) m
+  if " KEY " `isInfixOf` queries
+    then fail $ "Unexpected migration result: " ++ show m
+    else return ()
+  migr val
+  [val] @=?? (insert val >> select CondEmpty)
+
+testJSON :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
+testJSON = do
+  let val = Single "abc"
+  migr val
+  k <- insert val
+  A.Success k @=? A.fromJSON (A.toJSON k)
 
 testSchemas :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => m ()
 testSchemas = do
@@ -763,7 +823,7 @@ testSchemas = do
   let val2 = InAnotherSchema (Just k)
   Just val2 @=?? (insert val2 >>= get)
 
-testFloating :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, QueryRaw db ~ Snippet db, FloatingSqlDb db) => m ()
+testFloating :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, FloatingSqlDb db) => m ()
 testFloating = do
   let val = Single (pi :: Double)
   migr val
@@ -793,6 +853,30 @@ testFloating = do
   atanh (pi / 4) @=??~ atanh (liftExpr SingleField / 4)
   acosh (pi) @=??~ acosh (liftExpr SingleField)
 
+testSchemaAnalysis :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, SchemaAnalyzer m) => m ()
+testSchemaAnalysis = do
+  let val = Single (UniqueKeySample 1 2 (Just 3))
+  migr val
+  singleInfo <- analyzeTable (Nothing, persistName val)
+  uniqueInfo <- analyzeTable (Nothing, persistName (undefined :: UniqueKeySample))
+  let match (TableInfo cols1 uniqs1 refs1) (TableInfo cols2 uniqs2 refs2) =
+           haveSameElems ((==) `on` \x -> x {colDefault = Nothing}) cols1 cols2
+        && haveSameElems ((==) `on` \x -> x {uniqueDefName = Just ""}) uniqs1 uniqs2
+        && haveSameElems (\(_, r1) (_, r2) -> ((==) `on` (snd . referencedTableName)) r1 r2 && (haveSameElems (==) `on` referencedColumns) r1 r2 ) refs1 refs2
+      expectedSingleInfo = TableInfo [Column "id" False DbInt64 Nothing, Column "single#uniqueKey2" False DbInt64 Nothing, Column "single#uniqueKey3" True DbInt64 Nothing]
+        [UniqueDef Nothing (UniquePrimary True) [Left "id"]]
+        [(Nothing, Reference (Nothing, "UniqueKeySample") [("single#uniqueKey2","uniqueKey2"), ("single#uniqueKey3","uniqueKey3")] Nothing Nothing)]
+      expectedUniqueInfo = TableInfo [Column "uniqueKey1" False DbInt64 Nothing, Column "uniqueKey2" False DbInt64 Nothing, Column "uniqueKey3" True DbInt64 Nothing]
+        [UniqueDef Nothing UniqueConstraint [Left "uniqueKey1"], UniqueDef Nothing UniqueConstraint [Left "uniqueKey2",Left "uniqueKey3"], UniqueDef Nothing (UniquePrimary False) [Left "uniqueKey1", Left "uniqueKey2"]]
+        []
+
+  case singleInfo of
+    Just t | match t expectedSingleInfo -> return ()
+    _ -> liftIO $ H.assertFailure $ "Single does not match the expected schema: " ++ show singleInfo
+  case uniqueInfo of
+    Just t | match t expectedUniqueInfo -> return ()
+    _ -> liftIO $ H.assertFailure $ "UniqueKeySample does not match the expected schema: " ++ show uniqueInfo
+
 #if WITH_SQLITE
 testSchemaAnalysisSqlite :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Sqlite m ()
 testSchemaAnalysisSqlite = do
@@ -801,8 +885,8 @@ testSchemaAnalysisSqlite = do
   let action = "select * from \"Single#String\";"
   executeRaw False ("CREATE TRIGGER \"myTrigger\" AFTER DELETE ON \"Single#String\" FOR EACH ROW BEGIN " ++ action ++ " END") []
   ["Single#Single#String", "Single#String"] @=?? liftM sort (listTables Nothing)
-  ["myTrigger"] @=?? liftM sort (listTableTriggers Nothing "Single#String")
-  sql <- analyzeTrigger Nothing "myTrigger"
+  ["myTrigger"] @=?? liftM sort (listTableTriggers (Nothing, "Single#String"))
+  sql <- analyzeTrigger (Nothing, "myTrigger")
   let sql' = maybe (error "No trigger found") id sql
   liftIO $ action `isInfixOf` sql' H.@? "Trigger does not contain action statement"
 #endif
@@ -841,7 +925,7 @@ testArrays = do
   [Array [2, 3]] @=?? project (SingleField !: (int 2, int 3)) (AutoKeyField ==. k)
   [Array [1..4]] @=?? project (SingleField `Arr.append` explicitType (int 4)) (AutoKeyField ==. k)
   [Array [0..3]] @=?? project (explicitType (int 0) `Arr.prepend` SingleField) (AutoKeyField ==. k)
-  [Array [1..6]] @=?? project (SingleField `arrayCat` explicitType (Array [int 4..6])) (AutoKeyField ==. k)
+  [Array [1..6]] @=?? project (SingleField `arrayCat` Array [int 4..6]) (AutoKeyField ==. k)
   ["[1:3]"] @=?? project (arrayDims SingleField) (AutoKeyField ==. k)
   [1] @=?? project (arrayNDims SingleField) (AutoKeyField ==. k)
   [1] @=?? project (arrayLower SingleField 1) (AutoKeyField ==. k)
@@ -852,9 +936,9 @@ testArrays = do
   [] @=?? project AutoKeyField (AutoKeyField ==. k &&. Arr.any (int 0) SingleField)
   [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. Arr.all (int 2) (SingleField !: (int 2, int 2)))
   [] @=?? project AutoKeyField (AutoKeyField ==. k &&. Arr.all (int 2) SingleField)
-  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. SingleField Arr.@> explicitType (Array [int 2, 1]))
-  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. explicitType (Array [int 2, 1]) Arr.<@ SingleField)
-  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. explicitType (Array [int 3..10]) `overlaps` SingleField)
+  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. SingleField Arr.@> Array [int 2, 1])
+  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. Array [int 2, 1] Arr.<@ SingleField)
+  [k] @=?? project AutoKeyField (AutoKeyField ==. k &&. Array [int 3..10] `overlaps` SingleField)
   -- test escaping/unescaping
   let myString = ['\1'..'\255'] :: String
   let val2 = Single (Array[myString], Array[Array[myString]])
@@ -869,13 +953,32 @@ testSchemaAnalysisPostgresql = do
   executeRaw False "CREATE OR REPLACE FUNCTION \"myFunction\"() RETURNS trigger AS $$ BEGIN RETURN NEW;END; $$ LANGUAGE plpgsql" []
   executeRaw False ("CREATE TRIGGER \"myTrigger\" AFTER DELETE ON \"Single#String\" FOR EACH ROW " ++ action) []
   ["Single#Single#String", "Single#String"] @=?? liftM sort (listTables Nothing)
-  ["myTrigger"] @=?? liftM sort (listTableTriggers Nothing "Single#String")
-  trigSql <- analyzeTrigger Nothing "myTrigger"
+  ["myTrigger"] @=?? liftM sort (listTableTriggers (Nothing, "Single#String"))
+  trigSql <- analyzeTrigger (Nothing, "myTrigger")
   let trigSql' = maybe (error "No trigger found") id trigSql
   liftIO $ action `isInfixOf` trigSql' H.@? "Trigger does not contain action statement"
-  funcSql <- analyzeFunction Nothing "myFunction"
-  let funcSql' = maybe (error "No function found") id funcSql
-  liftIO $ "RETURN NEW;" `isInfixOf` funcSql' H.@? "Function does not contain action statement"
+  func <- analyzeFunction (Nothing, "myFunction")
+  let (args, ret, body) = fromMaybe (error "No function found") func
+  Just [] @=? args
+  Just (DbOther (OtherTypeDef [Left "trigger"])) @=? ret
+  liftIO $ "RETURN NEW;" `isInfixOf` body H.@? "Function does not contain action statement"
+
+testSelectDistinctOn :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m ()
+testSelectDistinctOn = do
+  let val1 = Single (5 :: Int, "abc")
+      val2 = Single (6 :: Int, "123")
+  migr val1
+  insert val1
+  insert $ Single (5 :: Int, "def")
+  insert val2
+  [val1, val2] @=?? (select $ CondEmpty `distinctOn` (SingleField ~> Tuple2_0Selector) `orderBy` [Asc $ SingleField ~> Tuple2_0Selector, Asc $ SingleField ~> Tuple2_1Selector])
+
+testExpressionIndex :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m ()
+testExpressionIndex = do
+  let val = ExpressionIndex 1
+  migr val
+  Just val @=?? (insert val >>= get)
+  assertExc "expression index should fail on duplicates" $ insert $ ExpressionIndex (-1)
 #endif
 
 #if WITH_MYSQL
@@ -886,14 +989,15 @@ testSchemaAnalysisMySQL = do
   let action = "delete from `Single#String`;"
   executeRaw' ("CREATE TRIGGER `myTrigger` AFTER DELETE ON `Single#String` FOR EACH ROW BEGIN " ++ action ++ " END") []
   ["Single#Single#String", "Single#String"] @=?? liftM sort (listTables Nothing)
-  ["myTrigger"] @=?? liftM sort (listTableTriggers Nothing "Single#String")
-  sql <- analyzeTrigger Nothing "myTrigger"
+  ["myTrigger"] @=?? liftM sort (listTableTriggers (Nothing, "Single#String"))
+  sql <- analyzeTrigger (Nothing, "myTrigger")
   let sql' = maybe (error "No trigger found") id sql
   liftIO $ action `isInfixOf` sql' H.@? "Trigger does not contain action statement"
   executeRaw' "CREATE FUNCTION myfunc() RETURNS decimal DETERMINISTIC BEGIN RETURN 42;END" []
-  funcSql <- analyzeFunction Nothing "myfunc"
-  let funcSql' = maybe (error "No function found") id funcSql
-  liftIO $ "RETURN 42" `isInfixOf` funcSql' H.@? "Function does not contain action statement"
+  func <- analyzeFunction (Nothing, "myfunc")
+  let (_, ret, body) = fromMaybe (error "No function found") func
+  Just (DbOther (OtherTypeDef [Left "decimal(10,0)"])) @=? ret
+  liftIO $ "RETURN 42" `isInfixOf` body H.@? "Function does not contain action statement"
 #endif
 
 assertExc :: (PersistBackend m, MonadBaseControl IO m, MonadIO m) => String -> m a -> m ()

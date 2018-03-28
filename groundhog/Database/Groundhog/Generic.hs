@@ -6,15 +6,14 @@ module Database.Groundhog.Generic
   -- * Migration
     createMigration
   , executeMigration
+  , executeMigrationSilent
   , executeMigrationUnsafe
-  , getQueries
   , runMigration
+  , runMigrationSilent
   , runMigrationUnsafe
+  , getQueries
   , printMigration
   , mergeMigrations
-  , silentMigrationLogger
-  , defaultMigrationLogger
-  , failMessage
   -- * Helpers for running Groundhog actions
   , HasConn
   , runDb
@@ -38,6 +37,8 @@ module Database.Groundhog.Generic
   , fromPersistValuesUnique
   , toSinglePersistValueAutoKey
   , fromSinglePersistValueAutoKey
+  , failMessage
+  , failMessageNamed
   -- * Other
   , bracket
   , finally
@@ -50,6 +51,8 @@ module Database.Groundhog.Generic
   , haveSameElems
   , mapAllRows
   , phantomDb
+  , getAutoKeyType
+  , getUniqueFields
   , isSimple
   , deleteByKey
   ) where
@@ -57,7 +60,7 @@ module Database.Groundhog.Generic
 import Database.Groundhog.Core
 
 import Control.Applicative ((<|>))
-import Control.Monad (liftM, forM_, (>=>))
+import Control.Monad (liftM, forM_, unless, (>=>))
 import Control.Monad.Logger (MonadLogger, NoLoggingT(..))
 import Control.Monad.Trans.State (StateT(..))
 import Control.Monad.Trans.Control (MonadBaseControl, control, restoreM)
@@ -68,9 +71,10 @@ import Data.Either (partitionEithers)
 import Data.Function (on)
 import Data.List (partition, sortBy)
 import qualified Data.Map as Map
+import System.IO (hPutStrLn, stderr)
 
 -- | Produce the migrations but not execute them. Fails when an unsafe migration occurs.
-createMigration :: PersistBackend m => Migration m -> m NamedMigrations
+createMigration :: Monad m => Migration m -> m NamedMigrations
 createMigration m = liftM snd $ runStateT m Map.empty
 
 -- | Returns either a list of errors in migration or a list of queries
@@ -81,25 +85,32 @@ getQueries runUnsafe (Right migs) = (if runUnsafe || null unsafe
   then Right $ map (\(_, _, query) -> query) migs'
   else Left $
     [ "Database migration: manual intervention required."
-    , "The following actions are considered unsafe:"
-    ] ++ map (\(_, _, query) -> query) unsafe) where
+    , "The proposed migration is:"
+    ] ++ map (\(isUnsafe, _, query) -> (if isUnsafe then unsafeWarning else replicate (length unsafeWarning) ' ') ++ query) migs') where
   migs' = sortBy (compare `on` \(_, i, _) -> i) migs
   unsafe = filter (\(isUnsafe, _, _) -> isUnsafe) migs'
+  unsafeWarning = "<UNSAFE>  "
 
-executeMigration' :: (PersistBackend m, MonadIO m) => Bool -> (String -> IO ()) -> NamedMigrations -> m ()
-executeMigration' runUnsafe logger m = do
+executeMigration' :: (PersistBackend m, MonadIO m) => Bool -> Bool -> NamedMigrations -> m ()
+executeMigration' runUnsafe silent m = do
   let migs = getQueries runUnsafe $ mergeMigrations $ Map.elems m
   case migs of
     Left errs -> fail $ unlines errs
-    Right qs -> mapM_ (executeMigrate logger) qs
+    Right qs -> forM_  qs $ \q -> do
+      unless silent $ liftIO $ hPutStrLn stderr $ "Migrating: " ++ q
+      executeRaw False q []
 
--- | Execute the migrations and log them. 
-executeMigration :: (PersistBackend m, MonadIO m) => (String -> IO ()) -> NamedMigrations -> m ()
-executeMigration = executeMigration' False
+-- | Execute the migrations with printing to stderr. Fails when an unsafe migration occurs.
+executeMigration :: (PersistBackend m, MonadIO m) => NamedMigrations -> m ()
+executeMigration = executeMigration' False False
 
--- | Execute migrations and log them. Executes the unsafe migrations without warnings
-executeMigrationUnsafe :: (PersistBackend m, MonadIO m) => (String -> IO ()) -> NamedMigrations -> m ()
-executeMigrationUnsafe = executeMigration' True
+-- | Execute the migrations. Fails when an unsafe migration occurs.
+executeMigrationSilent :: (PersistBackend m, MonadIO m) => NamedMigrations -> m ()
+executeMigrationSilent = executeMigration' False True
+
+-- | Execute migrations. Executes the unsafe migrations without warnings and prints them to stderr
+executeMigrationUnsafe :: (PersistBackend m, MonadIO m) => NamedMigrations -> m ()
+executeMigrationUnsafe = executeMigration' True False
 
 -- | Pretty print the migrations
 printMigration :: MonadIO m => NamedMigrations -> m ()
@@ -111,38 +122,32 @@ printMigration migs = liftIO $ forM_ (Map.assocs migs) $ \(k, v) -> do
       let showSql (isUnsafe, _, sql) = (if isUnsafe then "Unsafe:\t" else "Safe:\t") ++ sql
       mapM_ (putStrLn . ("\t" ++) . showSql) sqls
 
--- | Run migrations and log them. Fails when an unsafe migration occurs.
-runMigration :: (PersistBackend m, MonadIO m) => (String -> IO ()) -> Migration m -> m ()
-runMigration logger m = createMigration m >>= executeMigration logger
+-- | Creates migrations and executes them with printing to stderr. Fails when an unsafe migration occurs.
+-- > runMigration m = createMigration m >>= executeMigration
+runMigration :: (PersistBackend m, MonadIO m) => Migration m -> m ()
+runMigration m = createMigration m >>= executeMigration
 
--- | Run migrations and log them. Executes the unsafe migrations without warnings
-runMigrationUnsafe :: (PersistBackend m, MonadIO m) => (String -> IO ()) -> Migration m -> m ()
-runMigrationUnsafe logger m = createMigration m >>= executeMigrationUnsafe logger
+-- | Creates migrations and silently executes them. Fails when an unsafe migration occurs.
+-- > runMigration m = createMigration m >>= executeMigrationSilent
+runMigrationSilent :: (PersistBackend m, MonadIO m) => Migration m -> m ()
+runMigrationSilent m = createMigration m >>= executeMigrationSilent
 
-executeMigrate :: (PersistBackend m, MonadIO m) => (String -> IO ()) -> String -> m ()
-executeMigrate logger query = do
-  liftIO $ logger query
-  executeRaw False query []
-  return ()
-
--- | No-op
-silentMigrationLogger :: String -> IO ()
-silentMigrationLogger _ = return ()
-
--- | Prints the queries to stdout
-defaultMigrationLogger :: String -> IO ()
-defaultMigrationLogger query = putStrLn $ "Migrating: " ++ query
+-- | Creates migrations and executes them with printing to stderr. Executes the unsafe migrations without warnings
+-- > runMigrationUnsafe m = createMigration m >>= executeMigrationUnsafe
+runMigrationUnsafe :: (PersistBackend m, MonadIO m) => Migration m -> m ()
+runMigrationUnsafe m = createMigration m >>= executeMigrationUnsafe
 
 -- | Joins the migrations. The result is either all error messages or all queries
 mergeMigrations :: [SingleMigration] -> SingleMigration
-mergeMigrations ms =
-  let (errors, statements) = partitionEithers ms
-  in if null errors
-       then Right (concat statements)
-       else Left  (concat errors)
+mergeMigrations ms = case partitionEithers ms of
+  ([], statements) -> Right $ concat statements
+  (errors, _)      -> Left  $ concat errors
 
 failMessage :: PersistField a => a -> [PersistValue] -> String
-failMessage a xs = "Invalid list for " ++ persistName a ++ ": " ++ show xs
+failMessage a = failMessageNamed (persistName a)
+
+failMessageNamed :: String -> [PersistValue] -> String
+failMessageNamed name xs = "Invalid list for " ++ name ++ ": " ++ show xs
 
 finally :: MonadBaseControl IO m
         => m a -- ^ computation to run first
@@ -166,19 +171,19 @@ onException :: MonadBaseControl IO m
         -> m a
 onException io what = control $ \runInIO -> E.onException (runInIO io) (runInIO what)
 
-data PSFieldDef = PSFieldDef {
-    psFieldName :: String -- bar
-  , psDbFieldName :: Maybe String -- SQLbar
-  , psDbTypeName :: Maybe String -- inet, NUMERIC(5,2), VARCHAR(50)
-  , psExprName :: Maybe String -- BarField
-  , psEmbeddedDef :: Maybe [PSFieldDef]
-  , psDefaultValue :: Maybe String
-  , psReferenceParent :: Maybe (Maybe (Maybe String, String, [String]), Maybe ReferenceActionType, Maybe ReferenceActionType)
-} deriving Show
+data PSFieldDef str = PSFieldDef {
+    psFieldName :: str -- bar
+  , psDbFieldName :: Maybe str -- SQLbar
+  , psDbTypeName :: Maybe str -- inet, NUMERIC(5,2), VARCHAR(50)
+  , psExprName :: Maybe str -- BarField
+  , psEmbeddedDef :: Maybe [PSFieldDef str]
+  , psDefaultValue :: Maybe str
+  , psReferenceParent :: Maybe (Maybe ((Maybe str, str), [str]), Maybe ReferenceActionType, Maybe ReferenceActionType)
+} deriving (Eq, Show)
 
-applyDbTypeSettings :: PSFieldDef -> DbType -> DbType
+applyDbTypeSettings :: PSFieldDef String -> DbType -> DbType
 applyDbTypeSettings (PSFieldDef _ _ dbTypeName _ Nothing def psRef) typ = case typ of
-  DbTypePrimitive t nullable def' ref -> DbTypePrimitive (maybe t (DbOther . OtherTypeDef . const) dbTypeName) nullable (def <|> def') (applyReferencesSettings psRef ref)
+  DbTypePrimitive t nullable def' ref -> DbTypePrimitive (maybe t (\typeName -> DbOther $ OtherTypeDef [Left typeName]) dbTypeName) nullable (def <|> def') (applyReferencesSettings psRef ref)
   DbEmbedded emb ref -> DbEmbedded emb (applyReferencesSettings psRef ref)
   t -> t
 applyDbTypeSettings (PSFieldDef _ _ _ _ (Just subs) _ psRef) typ = (case typ of
@@ -194,7 +199,7 @@ applyDbTypeSettings (PSFieldDef _ _ _ _ (Just subs) _ psRef) typ = (case typ of
         Just name' -> (True, (name', applyDbTypeSettings fDef fType):fields')
     _ -> let (flag, fields') = go st fs in (flag, field:fields')
 
-applyReferencesSettings :: Maybe (Maybe (Maybe String, String, [String]), Maybe ReferenceActionType, Maybe ReferenceActionType) -> Maybe ParentTableReference -> Maybe ParentTableReference
+applyReferencesSettings :: Maybe (Maybe ((Maybe String, String), [String]), Maybe ReferenceActionType, Maybe ReferenceActionType) -> Maybe ParentTableReference -> Maybe ParentTableReference
 applyReferencesSettings Nothing ref = ref
 applyReferencesSettings (Just (parent, onDel, onUpd)) (Just (parent', onDel', onUpd')) = Just (maybe parent' Right parent, onDel <|> onDel', onUpd <|> onUpd')
 applyReferencesSettings (Just (Just parent, onDel, onUpd)) Nothing = Just (Right parent, onDel, onUpd)
@@ -257,17 +262,17 @@ fromSinglePersistValueAutoKey :: forall m v . (PersistBackend m, PersistEntity v
                               => PersistValue -> m v
 fromSinglePersistValueAutoKey x = phantomDb >>= \p -> get (fromPrimitivePersistValue p x :: Key v BackendSpecific) >>= maybe (fail $ "No data with id " ++ show x) return
 
-replaceOne :: (Eq c, Show c) => String -> (a -> c) -> (b -> c) -> (a -> b -> b) -> a -> [b] -> [b]
-replaceOne what getter1 getter2 apply a bs = case length (filter ((getter1 a ==) . getter2) bs) of
-  1 -> map (\b -> if getter1 a == getter2 b then apply a b else b) bs
-  0 -> error $ "Not found " ++ what ++ " with name " ++ show (getter1 a)
-  _ -> error $ "Found more than one " ++ what ++ " with name " ++ show (getter1 a)
-
-findOne :: (Eq c, Show c) => String -> (a -> c) -> (b -> c) -> a -> [b] -> b
-findOne what getter1 getter2 a bs = case filter ((getter1 a ==) . getter2) bs of
-  [b] -> b
+replaceOne :: (Eq x, Show x) => String -> (a -> x) -> (b -> x) -> (a -> b -> b) -> a -> [b] -> [b]
+replaceOne what getter1 getter2 apply a bs = case filter ((getter1 a ==) . getter2) bs of
+  [_] -> map (\b -> if getter1 a == getter2 b then apply a b else b) bs
   []  -> error $ "Not found " ++ what ++ " with name " ++ show (getter1 a)
   _   -> error $ "Found more than one " ++ what ++ " with name " ++ show (getter1 a)
+
+findOne :: (Eq x, Show x) => String -> (a -> x) -> x -> [a] -> a
+findOne what getter x as = case filter ((x ==) . getter) as of
+  [a] -> a
+  []  -> error $ "Not found " ++ what ++ " with name " ++ show x
+  _   -> error $ "Found more than one " ++ what ++ " with name " ++ show x
 
 -- | Returns only old elements, only new elements, and matched pairs (old, new).
 -- The new ones exist only in datatype, the old are present only in DB, match is typically by name (the properties of the matched elements may differ).
@@ -290,6 +295,14 @@ mapAllRows f pop = go where
 phantomDb :: PersistBackend m => m (proxy (PhantomDb m))
 phantomDb = return $ error "phantomDb"
 
+getAutoKeyType :: DbDescriptor db => proxy db -> DbTypePrimitive
+getAutoKeyType proxy = case dbType proxy ((undefined :: proxy db -> AutoKeyType db) proxy) of
+  DbTypePrimitive t _ _ _ -> t
+  t -> error $ "autoKeyType: unexpected key type " ++ show t
+
+getUniqueFields :: UniqueDef' str (Either field str) -> [field]
+getUniqueFields (UniqueDef _ _ uFields) = map (either id (error "A unique key may not contain expressions")) uFields
+
 isSimple :: [ConstructorDef] -> Bool
 isSimple [_] = True
 isSimple _   = False
@@ -298,7 +311,7 @@ isSimple _   = False
 class (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadReader cm m, ConnectionManager cm conn) => HasConn m cm conn
 instance (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadReader cm m, ConnectionManager cm conn) => HasConn m cm conn
 
--- | It helps to run database operations within your application monad.
+-- | It helps to run database operations within an application monad.
 runDb :: HasConn m cm conn => DbPersist conn m a -> m a
 runDb f = ask >>= withConn (runDbPersist f)
 

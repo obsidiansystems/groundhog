@@ -18,7 +18,7 @@ instance PersistField Point where
   persistName _ = "Point"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "point") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef [Left "point"]) False Nothing Nothing
 
 -- These two instances of superclasses are useful but not necessary. They are like Functor and Applicative instances when you implement a Monad.
 instance SinglePersistField Point where
@@ -47,7 +47,7 @@ mkPersist defaultCodegenConfig [groundhog|
 
 main = withPostgresqlConn "dbname=test user=test password=test host=localhost" . runDbConn $ do
   let phone = MobilePhone "+1900 654 321" "100.456" (Point 4 6) "127.0.0.1"
-  runMigration defaultMigrationLogger (migrate phone)
+  runMigration (migrate phone)
   k <- insert phone
   -- This will output the mobile phone data with money rounded to two fractional digits
   get k >>= liftIO . print

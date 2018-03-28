@@ -3,7 +3,6 @@
 
 module Database.Groundhog.TH.Settings
   ( PersistDefinitions(..)
-  , PersistDefinition(..)
   , THEntityDef(..)
   , THEmbeddedDef(..)
   , THPrimitiveDef(..)
@@ -27,14 +26,15 @@ import Database.Groundhog.Generic (PSFieldDef(..))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax (Lift(..))
 import Control.Applicative
-import Control.Monad (mzero)
-import Data.Yaml
+import Control.Monad (forM, mzero)
+import Data.Aeson
+import Data.Aeson.Types (Pair)
+import qualified Data.Foldable as Fold
+import qualified Data.HashMap.Strict as H
+import Data.Maybe (catMaybes)
+import Data.Text (Text)
 
-data PersistDefinitions = PersistDefinitions {definitions :: [PersistDefinition]} deriving Show
-data PersistDefinition = PSEntityDef' PSEntityDef
-                       | PSEmbeddedDef' PSEmbeddedDef
-                       | PSPrimitiveDef' PSPrimitiveDef
-     deriving Show
+data PersistDefinitions = PersistDefinitions {psEntities :: [PSEntityDef], psEmbeddeds :: [PSEmbeddedDef], psPrimitives :: [PSPrimitiveDef]} deriving Show
 
 -- data SomeData a = U1 { foo :: Int} | U2 { bar :: Maybe String, asc :: Int64, add :: a} | U3 deriving (Show, Eq)
 
@@ -46,26 +46,26 @@ data THEntityDef = THEntityDef {
   , thUniqueKeys :: [THUniqueKeyDef]
   , thTypeParams :: [TyVarBndr]
   , thConstructors :: [THConstructorDef]
-} deriving Show
+} deriving (Eq, Show)
 
 data THAutoKeyDef = THAutoKeyDef {
     thAutoKeyConstrName :: String
   , thAutoKeyIsDef :: Bool
-} deriving Show
+} deriving (Eq, Show)
 
 data THEmbeddedDef = THEmbeddedDef {
     thEmbeddedName :: Name
   , thEmbeddedConstructorName :: Name
-  , thDbEmbeddedName :: String -- used only to set polymorphic part of name of its container
+  , thDbEmbeddedName :: String -- ^ It is used only to set polymorphic part of name of its container
   , thEmbeddedTypeParams :: [TyVarBndr]
   , thEmbeddedFields :: [THFieldDef]
-} deriving Show
+} deriving (Eq, Show)
 
 data THPrimitiveDef = THPrimitiveDef {
     thPrimitiveName :: Name
-  , thPrimitiveDbName :: String -- used only to set polymorphic part of name of its container
-  , thPrimitiveStringRepresentation :: Bool -- store in database as string using Show/Read instances or as integer using Enum instance
-} deriving Show
+  , thPrimitiveDbName :: String -- ^ It is used only to set polymorphic part of name of its container
+  , thPrimitiveStringEnumRepresentation :: Bool -- ^ Store in database as string using Show/Read instances (True) or as integer using Enum instance (False).
+} deriving (Eq, Show)
 
 data THConstructorDef = THConstructorDef {
     thConstrName    :: Name -- U2
@@ -74,7 +74,7 @@ data THConstructorDef = THConstructorDef {
   , thDbAutoKeyName :: Maybe String -- u2_id
   , thConstrFields  :: [THFieldDef]
   , thConstrUniques :: [THUniqueDef]
-} deriving Show
+} deriving (Eq, Show)
 
 data THFieldDef = THFieldDef {
     thFieldName :: String -- bar
@@ -82,26 +82,27 @@ data THFieldDef = THFieldDef {
   , thDbTypeName :: Maybe String -- inet, NUMERIC(5, 2), VARCHAR(50)
   , thExprName :: String -- BarField
   , thFieldType :: Type
-  , thEmbeddedDef :: Maybe [PSFieldDef]
+  , thEmbeddedDef :: Maybe [PSFieldDef String]
   , thDefaultValue :: Maybe String
-  , thReferenceParent :: Maybe (Maybe (Maybe String, String, [String]), Maybe ReferenceActionType, Maybe ReferenceActionType)
-} deriving Show
+  , thReferenceParent :: Maybe (Maybe ((Maybe String, String), [String]), Maybe ReferenceActionType, Maybe ReferenceActionType)
+} deriving (Eq, Show)
 
 data THUniqueDef = THUniqueDef {
     thUniqueName :: String
   , thUniqueType :: UniqueType
-  , thUniqueFields :: [String]
-} deriving Show
+  , thUniqueFields :: [Either String String] -- ^ Either name of field, i.e, thFieldName, or expression
+} deriving (Eq, Show)
 
 data THUniqueKeyDef = THUniqueKeyDef {
     thUniqueKeyName :: String
   , thUniqueKeyPhantomName :: String
   , thUniqueKeyConstrName :: String
-  , thUniqueKeyDbName :: String -- used only to set polymorphic part of name of its container
+  , thUniqueKeyDbName :: String -- ^ It is used only to set polymorphic part of name of its container
+    -- | It should repeat fields from THUniqueDef but it may give different settings for them. It is done to allow foreign key fields to be different from parent fields of the entity. These fields are used for creating a the key constructor and instances for it. For example, it can have a default value, or even a different type (INT8 may reference INT4).
   , thUniqueKeyFields :: [THFieldDef]
-  , thUniqueKeyMakeEmbedded :: Bool -- whether to make it an instance of Embedded
+  , thUniqueKeyMakeEmbedded :: Bool -- ^ If True, make it an instance of Embedded
   , thUniqueKeyIsDef :: Bool
-} deriving Show
+} deriving (Eq, Show)
 
 data PSEntityDef = PSEntityDef {
     psDataName :: String -- SomeData
@@ -110,60 +111,55 @@ data PSEntityDef = PSEntityDef {
   , psAutoKey :: Maybe (Maybe PSAutoKeyDef) -- SomeDataKey. Nothing - default key. Just Nothing - no autokey. Just (Just _) - specify autokey settings
   , psUniqueKeys :: Maybe [PSUniqueKeyDef]
   , psConstructors :: Maybe [PSConstructorDef]
-} deriving Show
+} deriving (Eq, Show)
 
 data PSEmbeddedDef = PSEmbeddedDef {
     psEmbeddedName :: String
-  , psDbEmbeddedName :: Maybe String -- used only to set polymorphic part of name of its container
-  , psEmbeddedFields :: Maybe [PSFieldDef]
-} deriving Show
+  , psDbEmbeddedName :: Maybe String -- ^ It is used only to set polymorphic part of name of its container
+  , psEmbeddedFields :: Maybe [PSFieldDef String]
+} deriving (Eq, Show)
 
 data PSPrimitiveDef = PSPrimitiveDef {
     psPrimitiveName :: String
-  , psPrimitiveDbName :: Maybe String -- used only to set polymorphic part of name of its container
-  , psPrimitiveStringRepresentation :: Maybe Bool -- store in database as string using Show/Read instances or as integer using Enum instance
-} deriving Show
+  , psPrimitiveDbName :: Maybe String -- ^ It is used only to set polymorphic part of name of its container
+  , psPrimitiveStringEnumRepresentation :: Maybe Bool -- ^ Store in database as string using Show/Read instances (True) or as integer using Enum instance (False).
+} deriving (Eq, Show)
 
 data PSConstructorDef = PSConstructorDef {
     psConstrName :: String -- U2
   , psPhantomConstrName :: Maybe String -- U2Constructor
   , psDbConstrName :: Maybe String -- SQLU2
-  , psDbAutoKeyName :: Maybe (Maybe String) -- u2_id
-  , psConstrFields  :: Maybe [PSFieldDef]
+  , psDbAutoKeyName :: Maybe String -- u2_id
+  , psConstrFields  :: Maybe [PSFieldDef String]
   , psConstrUniques :: Maybe [PSUniqueDef]
-} deriving Show
+} deriving (Eq, Show)
 
 data PSUniqueDef = PSUniqueDef {
     psUniqueName :: String
   , psUniqueType :: Maybe UniqueType
-  , psUniqueFields :: [String]
-} deriving Show
+  , psUniqueFields :: [Either String String]
+} deriving (Eq, Show)
 
 data PSUniqueKeyDef = PSUniqueKeyDef {
     psUniqueKeyName :: String
   , psUniqueKeyPhantomName :: Maybe String
   , psUniqueKeyConstrName :: Maybe String
   , psUniqueKeyDbName :: Maybe String
-  , psUniqueKeyFields :: Maybe [PSFieldDef]
+  , psUniqueKeyFields :: Maybe [PSFieldDef String]
   , psUniqueKeyMakeEmbedded :: Maybe Bool
   , psUniqueKeyIsDef :: Maybe Bool
-} deriving Show
+} deriving (Eq, Show)
 
 data PSAutoKeyDef = PSAutoKeyDef {
     psAutoKeyConstrName :: Maybe String
   , psAutoKeyIsDef :: Maybe Bool
-} deriving Show
-
-instance Lift PersistDefinition where
-  lift (PSEntityDef' e) = [| PSEntityDef' e |]
-  lift (PSEmbeddedDef' e) = [| PSEmbeddedDef' e |]
-  lift (PSPrimitiveDef' e) = [| PSPrimitiveDef' e |]
+} deriving (Eq, Show)
 
 instance Lift PSPrimitiveDef where
-  lift (PSPrimitiveDef {..}) = [| PSPrimitiveDef $(lift psPrimitiveName) $(lift psPrimitiveDbName) $(lift psPrimitiveStringRepresentation) |]
+  lift (PSPrimitiveDef {..}) = [| PSPrimitiveDef $(lift psPrimitiveName) $(lift psPrimitiveDbName) $(lift psPrimitiveStringEnumRepresentation) |]
 
 instance Lift PersistDefinitions where
-  lift (PersistDefinitions {..}) = [| PersistDefinitions $(lift definitions) |]
+  lift (PersistDefinitions {..}) = [| PersistDefinitions $(lift psEntities) $(lift psEmbeddeds) $(lift psPrimitives) |]
 
 instance Lift PSEntityDef where
   lift (PSEntityDef {..}) = [| PSEntityDef $(lift psDataName) $(lift psDbEntityName) $(lift psEntitySchema) $(lift psAutoKey) $(lift psUniqueKeys) $(lift psConstructors) |]
@@ -180,7 +176,7 @@ instance Lift PSUniqueDef where
 instance Lift UniqueType where
   lift UniqueConstraint = [| UniqueConstraint |]
   lift UniqueIndex = [| UniqueIndex |]
-  lift UniquePrimary = [| UniquePrimary |]
+  lift (UniquePrimary x) = [| UniquePrimary $(lift x) |]
 
 instance Lift ReferenceActionType where
   lift NoAction = [| NoAction |]
@@ -189,7 +185,7 @@ instance Lift ReferenceActionType where
   lift SetNull = [| SetNull |]
   lift SetDefault = [| SetDefault |]
 
-instance Lift PSFieldDef where
+instance Lift (PSFieldDef String) where
   lift (PSFieldDef {..}) = [| PSFieldDef $(lift psFieldName) $(lift psDbFieldName) $(lift psDbTypeName) $(lift psExprName) $(lift psEmbeddedDef) $(lift psDefaultValue) $(lift psReferenceParent) |]
 
 instance Lift PSUniqueKeyDef where
@@ -207,31 +203,33 @@ instance FromJSON PersistDefinitions where
         ---
           entity: name
   -}
-  parseJSON value = PersistDefinitions <$> case value of
+  parseJSON value = (case value of
     Object v -> do
       defs <- v .:? "definitions"
       case defs of
-        Just defs'@(Array _) -> parseJSON defs'
+        Just (Array arr) -> Fold.foldrM go initial arr
+        Nothing -> go value initial
         Just _ -> mzero
-        Nothing -> fmap (\a -> [a]) $ parseJSON value
-    defs@(Array _) -> parseJSON defs
-    _ -> mzero
+    Array arr -> Fold.foldrM go initial arr
+    _ -> mzero) where
+    initial = PersistDefinitions [] [] []
+    go obj p@(PersistDefinitions{..}) = flip (withObject "definition") obj $ \v -> case () of
+      _ | H.member "entity" v -> (\x -> p {psEntities = x:psEntities}) <$> parseJSON obj
+      _ | H.member "embedded" v -> (\x -> p {psEmbeddeds = x:psEmbeddeds}) <$> parseJSON obj
+      _ | H.member "primitive" v -> (\x -> p {psPrimitives = x:psPrimitives}) <$> parseJSON obj
+      _ -> fail $ "Invalid definition: " ++ show obj
 
-instance FromJSON PersistDefinition where
-  parseJSON obj = PSEntityDef' <$> parseJSON obj
-              <|> PSEmbeddedDef' <$> parseJSON obj
-              <|> PSPrimitiveDef' <$> parseJSON obj
 
 instance FromJSON PSEntityDef where
-  parseJSON (Object v) = PSEntityDef <$> v .: "entity" <*> v .:? "dbName" <*> v .:? "schema" <*> optional (v .: "autoKey") <*> v .:? "keys" <*> v .:? "constructors"
-  parseJSON _          = mzero
+  parseJSON = withObject "entity" $ \v ->
+    PSEntityDef <$> v .: "entity" <*> v .:? "dbName" <*> v .:? "schema" <*> optional (v .: "autoKey") <*> v .:? "keys" <*> v .:? "constructors"
 
 instance FromJSON PSEmbeddedDef where
-  parseJSON (Object v) = PSEmbeddedDef <$> v .: "embedded" <*> v .:? "dbName" <*> v .:? "fields"
-  parseJSON _          = mzero
+  parseJSON = withObject "embedded" $ \v ->
+    PSEmbeddedDef <$> v .: "embedded" <*> v .:? "dbName" <*> v .:? "fields"
 
 instance FromJSON PSPrimitiveDef where
-  parseJSON (Object v) = do
+  parseJSON = withObject "primitive" $ \v -> do
     x <- v .:? "representation"
     let representation = case x of
           Nothing -> pure True
@@ -239,20 +237,23 @@ instance FromJSON PSPrimitiveDef where
           Just "enum" -> pure False
           Just r -> fail $ "parseJSON: representation expected [\"showread\",\"enum\"], but got " ++ r
     PSPrimitiveDef <$> v .: "primitive" <*> v .:? "dbName" <*> pure representation
-  parseJSON _          = mzero
 
 instance FromJSON PSConstructorDef where
-  parseJSON (Object v) = PSConstructorDef <$> v .: "name" <*> v .:? "phantomName" <*> v .:? "dbName" <*> v .:? "keyDbName" <*> v .:? "fields" <*> v .:? "uniques"
-  parseJSON _          = mzero
+  parseJSON = withObject "constructor" $ \v ->
+     PSConstructorDef <$> v .: "name" <*> v .:? "phantomName" <*> v .:? "dbName" <*> v .:? "keyDbName" <*> v .:? "fields" <*> v .:? "uniques"
 
 instance FromJSON PSUniqueDef where
-  parseJSON (Object v) = PSUniqueDef <$> v .: "name" <*> v .:? "type" <*> v .: "fields"
-  parseJSON _          = mzero
+  parseJSON = withObject "unique" $ \v -> do
+    fields <- v .: "fields"
+    fields' <- forM fields $ \f -> case f of
+      Object expr  -> Right <$> expr .: "expr"
+      field -> Left <$> parseJSON field
+    PSUniqueDef <$> v .: "name" <*> v .:? "type" <*> pure fields'
 
 instance FromJSON UniqueType where
   parseJSON o = do
     x <- parseJSON o
-    let vals = [("constraint", UniqueConstraint), ("index", UniqueIndex), ("primary", UniquePrimary)]
+    let vals = [("constraint", UniqueConstraint), ("index", UniqueIndex), ("primary", UniquePrimary False)]
     case lookup x vals of
       Just a -> return a
       Nothing -> fail $ "parseJSON: UniqueType expected " ++ show (map fst vals) ++ ", but got " ++ x
@@ -265,25 +266,73 @@ instance FromJSON ReferenceActionType where
       Just a -> return a
       Nothing -> fail $ "parseJSON: UniqueType expected " ++ show (map fst vals) ++ ", but got " ++ x
 
-instance FromJSON PSFieldDef where
-  parseJSON (Object v) = PSFieldDef <$> v .: "name" <*> v .:? "dbName" <*> v .:? "type" <*> v .:? "exprName" <*> v .:? "embeddedType" <*> v .:? "default" <*> mkRefSettings where
-    mkRefSettings = do
+instance FromJSON (PSFieldDef String) where
+  parseJSON = withObject "field" $ \v ->
+    PSFieldDef <$> v .: "name" <*> v .:? "dbName" <*> v .:? "type" <*> v .:? "exprName" <*> v .:? "embeddedType" <*> v .:? "default" <*> mkRefSettings v where
+    mkRefSettings v = do
       ref <- v .:? "reference"
       (parent, onDel, onUpd) <- case ref of
-        Just (Object r) -> (,,) <$> parentRef <*> r .:? "onDelete" <*> r .:? "onUpdate" where
-          parentRef = optional ((,,) <$> r .:? "schema" <*> r .: "table" <*> r .: "columns")
+        Just (Object r) -> (,,) <$> optional parentRef <*> r .:? "onDelete" <*> r .:? "onUpdate" where
+          parentRef = (,) <$> ((,) <$> r .:? "schema" <*> r .: "table") <*> r .: "columns"
         _ -> pure (Nothing, Nothing, Nothing)
       -- this temporary solution uses onDelete and onUpdate both from inside reference object (preferred) and from field level (for compatibility)
       (onDel', onUpd') <- (,) <$> v .:? "onDelete" <*> v .:? "onUpdate"
       pure $ case (parent, onDel <|> onDel', onUpd <|> onUpd') of
         (Nothing, Nothing, Nothing) -> Nothing
         refSettings -> Just refSettings
-  parseJSON _          = mzero
 
 instance FromJSON PSUniqueKeyDef where
-  parseJSON (Object v) = PSUniqueKeyDef <$> v .: "name" <*> v .:? "keyPhantom" <*> v .:? "constrName" <*> v .:? "dbName" <*> v .:? "fields" <*> v .:? "mkEmbedded" <*> v .:? "default"
-  parseJSON _          = mzero
+  parseJSON = withObject "unique key" $ \v ->
+    PSUniqueKeyDef <$> v .: "name" <*> v .:? "keyPhantom" <*> v .:? "constrName" <*> v .:? "dbName" <*> v .:? "fields" <*> v .:? "mkEmbedded" <*> v .:? "default"
 
 instance FromJSON PSAutoKeyDef where
-  parseJSON (Object v) = PSAutoKeyDef <$> v .:? "constrName" <*> v .:? "default"
-  parseJSON _          = mzero
+  parseJSON = withObject "autogenerated key" $ \v ->
+    PSAutoKeyDef <$> v .:? "constrName" <*> v .:? "default"
+
+(.=?) :: ToJSON a => Text -> Maybe a -> Maybe Pair
+name .=? value = (name .=) <$> value
+
+(.=:) :: ToJSON a => Text -> Maybe [a] -> Maybe Pair
+name .=: value = case value of
+  Just (_:_) -> Just $ name .= value
+  _          -> Nothing
+
+instance ToJSON PSEntityDef where
+  toJSON PSEntityDef{..} = object $ catMaybes [Just $ "entity" .= psDataName, "dbName" .=? psDbEntityName, "schema" .=? psEntitySchema, "autoKey" .=? psAutoKey, "keys" .=: psUniqueKeys, "constructors" .=: psConstructors]
+
+instance ToJSON PSConstructorDef where
+  toJSON PSConstructorDef{..} = object $ catMaybes [Just $ "name" .= psConstrName, "phantomName" .=? psPhantomConstrName, "dbName" .=? psDbConstrName, "keyDbName" .=? psDbAutoKeyName, "fields" .=: psConstrFields, "uniques" .=: psConstrUniques]
+
+instance ToJSON PSUniqueDef where
+  toJSON PSUniqueDef{..} = object $ catMaybes [Just $ "name" .= psUniqueName, "type" .=? psUniqueType, "fields" .=? fields] where
+    fields = if null psUniqueFields
+      then Nothing
+      else Just $ map (either toJSON (\x -> object ["expr" .= x])) psUniqueFields
+
+instance ToJSON UniqueType where
+  toJSON a = toJSON $ case a of
+    UniqueConstraint -> "constraint" :: String
+    UniqueIndex      -> "index"
+    UniquePrimary _  -> "primary"
+
+instance ToJSON ReferenceActionType where
+  toJSON a = toJSON $ case a of
+    NoAction   -> "no action" :: String
+    Restrict   -> "restrict"
+    Cascade    -> "cascade"
+    SetNull    -> "set null"
+    SetDefault -> "set default"
+
+instance ToJSON (PSFieldDef String) where
+  toJSON PSFieldDef{..} = object $ catMaybes [Just $ "name" .= psFieldName, "dbName" .=? psDbFieldName, "type" .=? psDbTypeName, "exprName" .=? psExprName, "embeddedType" .=: psEmbeddedDef, "default" .=? psDefaultValue, "reference" .=? (psReferenceParent >>= mkRefSettings)] where
+    mkRefSettings (parent, onDel, onUpd) = if null fields then Nothing else Just $ object fields where
+      fields = catMaybes $ parent' ++ ["onDelete" .=? onDel, "onUpdate" .=? onUpd]
+      parent' = case parent of
+        Nothing -> []
+        Just ((schema, table), columns) -> ["schema" .=? schema, Just $ "table" .= table, Just $ "columns" .= columns]
+
+instance ToJSON PSUniqueKeyDef where
+  toJSON PSUniqueKeyDef{..} = object $ catMaybes [Just $ "name" .= psUniqueKeyName, "keyPhantom" .=? psUniqueKeyPhantomName, "constrName" .=? psUniqueKeyConstrName, "dbName" .=? psUniqueKeyDbName, "mkEmbedded" .=? psUniqueKeyMakeEmbedded, "default" .=? psUniqueKeyIsDef, "fields" .=: psUniqueKeyFields]
+
+instance ToJSON PSAutoKeyDef where
+  toJSON PSAutoKeyDef{..} = object $ catMaybes ["constrName" .=? psAutoKeyConstrName, "default" .=? psAutoKeyIsDef]

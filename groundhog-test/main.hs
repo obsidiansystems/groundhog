@@ -26,7 +26,7 @@ main :: IO ()
 main = do
 #if WITH_POSTGRESQL
   let postgresql = [testGroup "Database.Groundhog.Postgresql" $ concatMap ($ runPSQL) [mkTestSuite, mkSqlTestSuite, postgresqlTestSuite]]
-      runPSQL m = withPostgresqlConn "dbname=test user=test password=test host=localhost" . runDbConn $ cleanPostgresql >> m
+      runPSQL m = withPostgresqlConn "dbname=test user=test password=test host=localhost" . runDbConn $ m >> cleanPostgresql
 #else
   let postgresql = []
 #endif
@@ -44,7 +44,7 @@ main = do
                         , connectPassword = "test"
                         , connectDatabase = "test"
                         }
-      runMySQL m = withMySQLConn mySQLConnInfo . runDbConn $ cleanMySQL >> m
+      runMySQL m = withMySQLConn mySQLConnInfo . runDbConn $ m >> cleanMySQL
 #else
   let mysql = []
 #endif
@@ -52,13 +52,13 @@ main = do
 
 #if WITH_POSTGRESQL
 cleanPostgresql :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist Postgresql m ()
-cleanPostgresql = forM_ ["public", "myschema"] $ \schema -> do
-  executeRaw True ("drop schema if exists " ++ schema ++ " cascade") []
-  executeRaw True ("create schema " ++ schema) []
-  executeRaw True ("alter schema " ++ schema ++ " owner to test") []
+cleanPostgresql = do
+  executeRaw True "rollback" []
+  executeRaw True "begin" []
 #endif
 
 #if WITH_MYSQL
+-- DDL statements are committed automatically so we cannot rollback them.
 cleanMySQL :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => DbPersist MySQL m ()
 cleanMySQL = do
   executeRaw True "SET FOREIGN_KEY_CHECKS = 0" []
@@ -69,7 +69,7 @@ cleanMySQL = do
   executeRaw True "SET FOREIGN_KEY_CHECKS = 1" []
 #endif
 
-mkSqlTestSuite :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db, QueryRaw db ~ Snippet db) => (m () -> IO ()) -> [Test]
+mkSqlTestSuite :: (PersistBackend m, MonadBaseControl IO m, MonadIO m, db ~ PhantomDb m, SqlDb db) => (m () -> IO ()) -> [Test]
 mkSqlTestSuite run = map (\(name, func) -> testCase name $ run func)
   [ ("testSelect", testSelect)
   , ("testCond", testCond)
@@ -82,6 +82,7 @@ mkTestSuite run = map (\(name, func) -> testCase name $ run func)
   [ ("testNumber", testNumber)
   , ("testPersistSettings", testPersistSettings)
   , ("testEmbedded", testEmbedded)
+  , ("testSelectDistinct", testSelectDistinct)
   , ("testInsert", testInsert)
   , ("testMaybe", testMaybe)
   , ("testCount", testCount)
@@ -114,12 +115,16 @@ mkTestSuite run = map (\(name, func) -> testCase name $ run func)
   , ("testAutoKeyField", testAutoKeyField)
   , ("testTime", testTime)
   , ("testPrimitiveData", testPrimitiveData)
+  , ("testNoColumns", testNoColumns)
+  , ("testNoKeys", testNoKeys)
+  , ("testJSON", testJSON)
   ]
 
 #if WITH_SQLITE
 sqliteTestSuite :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => (DbPersist Sqlite m () -> IO ()) -> [Test]
 sqliteTestSuite run = map (\(name, func) -> testCase name $ run func)
   [ ("testMigrateOrphanConstructors", testMigrateOrphanConstructors)
+  , ("testSchemaAnalysis", testSchemaAnalysis)
   , ("testSchemaAnalysisSqlite", testSchemaAnalysisSqlite)
   , ("testListTriggersOnDelete", testListTriggersOnDelete)
   , ("testListTriggersOnUpdate", testListTriggersOnUpdate)
@@ -132,10 +137,13 @@ postgresqlTestSuite run = map (\(name, func) -> testCase name $ run func)
   [ ("testGeometry", testGeometry)
   , ("testArrays", testArrays)
   , ("testSchemas", testSchemas)
+  , ("testSchemaAnalysis", testSchemaAnalysis)
   , ("testSchemaAnalysisPostgresql", testSchemaAnalysisPostgresql)
   , ("testFloating", testFloating)
   , ("testListTriggersOnDelete", testListTriggersOnDelete)
   , ("testListTriggersOnUpdate", testListTriggersOnUpdate)
+  , ("testSelectDistinctOn", testSelectDistinctOn)
+  , ("testExpressionIndex", testExpressionIndex)
   ]
 #endif
 
@@ -143,6 +151,7 @@ postgresqlTestSuite run = map (\(name, func) -> testCase name $ run func)
 mysqlTestSuite :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => (DbPersist MySQL m () -> IO ()) -> [Test]
 mysqlTestSuite run = map (\(name, func) -> testCase name $ run func)
   [ ("testSchemas", testSchemas)
+  , ("testSchemaAnalysis", testSchemaAnalysis)
   , ("testSchemaAnalysisMySQL", testSchemaAnalysisMySQL)
   , ("testFloating", testFloating)
 --  , ("testListTriggersOnDelete", testListTriggersOnDelete)  -- fails due to MySQL bug #11472

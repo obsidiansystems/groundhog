@@ -1,8 +1,8 @@
 ## Interact with relational databases in Haskell [![Build Status](https://travis-ci.org/lykahb/groundhog.png?branch=master)](https://travis-ci.org/lykahb/groundhog)
 
-Migrate and access PostgreSQL, MySQL, and SQLite with type safety and detailed control. 
+Access PostgreSQL, MySQL, and SQLite with type safety.
 Advanced migration capabilities allow you to precisely specify the schema description, fitting it to an existing database, or
-creating a migration script for a new one. Groundhog is not opinionated about schema and can bind your datatypes to a relational model which may have composite keys, references across different schemas, indexes, etc.
+creating a migration script for a new one. Groundhog is not opinionated about schema and can bind your datatypes to a relational model which may have composite keys, references across multiple schemas, indexes, etc.
 It is used in hobby projects and commercial applications.
 
 ## Useful links
@@ -35,7 +35,7 @@ mkPersist defaultCodegenConfig [groundhog|
 |]
 
 main = withSqliteConn ":memory:" $ runDbConn $ do
-  runMigration defaultMigrationLogger $ do
+  runMigration $ do
     migrate (undefined :: Machine)
     migrate (undefined :: Part)
 ```
@@ -60,3 +60,12 @@ liftIO $ putStrLn $ "Megatron from DB: " ++ show megatronFromDB
 parts <- select $ (MachineField ==. megatron &&. lower PartNameField `notLike` "%tiny%") `orderBy` [Asc PartNameField]
 liftIO $ putStrLn $ "Big parts for the Megatron: " ++ show parts
 ```
+
+### User experience
+
+> I was impressed with groundhog's approach from the very beginning. Now I've been using groundhog for the past 8 or 9 months and am very
+pleased.  Groundhog's approach for mapping data types to database tables is powerful and composable while at the same time being quite
+easy to use.  Its migration facilities allow me to iterate very quickly when building applications.  Boris's support has been
+fantastic whenever I have encountered issues. Groundhog is definitely my first choice when I need a Haskell "ORM".
+
+Doug Beardsley, Soostone Inc.

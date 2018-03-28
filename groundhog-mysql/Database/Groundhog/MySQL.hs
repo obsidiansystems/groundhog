@@ -31,7 +31,8 @@ import qualified Database.MySQL.Simple.Types  as MySQL
 import qualified Database.MySQL.Base          as MySQLBase
 import qualified Database.MySQL.Base.Types    as MySQLBase
 
-import Control.Arrow ((***))
+import Control.Applicative ((<|>))
+import Control.Arrow (first, second, (***))
 import Control.Monad (liftM, liftM2, (>=>))
 import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Logger (MonadLogger, logDebugS)
@@ -43,8 +44,9 @@ import Data.Char (toUpper)
 import Data.Function (on)
 import Data.Int (Int64)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (groupBy, intercalate, intersect, partition, stripPrefix)
+import Data.List (groupBy, intercalate, intersect, isInfixOf, partition, stripPrefix)
 import Data.Maybe (fromJust, fromMaybe, isJust)
+import Data.Monoid
 import Data.Pool
 
 newtype MySQL = MySQL MySQL.Connection
@@ -73,7 +75,7 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (Db
   insertByAll v = H.insertByAll renderConfig queryRaw' True v
   replace k v = H.replace renderConfig queryRaw' executeRaw' insertIntoConstructorTable k v
   replaceBy k v = H.replaceBy renderConfig executeRaw' k v
-  select options = H.select renderConfig queryRaw' noLimit options
+  select options = H.select renderConfig queryRaw' preColumns noLimit options
   selectAll = H.selectAll renderConfig queryRaw'
   get k = H.get renderConfig queryRaw' k
   getBy k = H.getBy renderConfig queryRaw' k
@@ -83,7 +85,7 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (Db
   deleteAll v = H.deleteAll renderConfig executeRaw' v
   count cond = H.count renderConfig queryRaw' cond
   countAll fakeV = H.countAll renderConfig queryRaw' fakeV
-  project p options = H.project renderConfig queryRaw' noLimit p options
+  project p options = H.project renderConfig queryRaw' preColumns noLimit p options
   migrate fakeV = migrate' fakeV
 
   executeRaw _ query ps = executeRaw' (fromString query) ps
@@ -94,19 +96,24 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (Db
 
 instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => SchemaAnalyzer (DbPersist MySQL m) where
   schemaExists schema = queryRaw' "SELECT 1 FROM information_schema.schemata WHERE schema_name=?" [toPrimitivePersistValue proxy schema] (fmap isJust)
+  getCurrentSchema = queryRaw' "SELECT database()" [] (fmap (>>= fst . fromPurePersistValues proxy))
   listTables schema = queryRaw' "SELECT table_name FROM information_schema.tables WHERE table_schema=coalesce(?,database())" [toPrimitivePersistValue proxy schema] (mapAllRows $ return . fst . fromPurePersistValues proxy)
-  listTableTriggers schema name = queryRaw' "SELECT trigger_name FROM information_schema.triggers WHERE event_object_schema=coalesce(?,database()) AND event_object_table=?" [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] (mapAllRows $ return . fst . fromPurePersistValues proxy)
+  listTableTriggers name = queryRaw' "SELECT trigger_name FROM information_schema.triggers WHERE event_object_schema=coalesce(?,database()) AND event_object_table=?" (toPurePersistValues proxy name []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
   analyzeTable = analyzeTable'
-  analyzeTrigger schema name = do
-    x <- queryRaw' "SELECT action_statement FROM information_schema.triggers WHERE trigger_schema=coalesce(?,database()) AND trigger_name=?" [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] id
-    case x of
-      Nothing  -> return Nothing
-      Just src -> return (fst $ fromPurePersistValues proxy src)
-  analyzeFunction schema name = do
-    x <- queryRaw' "SELECT routine_definition FROM information_schema.routines WHERE routine_schema=coalesce(?,database())  AND routine_name=?" [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] id
-    case x of
-      Nothing  -> return Nothing
-      Just src -> return (fst $ fromPurePersistValues proxy src)
+  analyzeTrigger name = do
+    x <- queryRaw' "SELECT action_statement FROM information_schema.triggers WHERE trigger_schema=coalesce(?,database()) AND trigger_name=?" (toPurePersistValues proxy name []) id
+    return $ case x of
+      Nothing  -> Nothing
+      Just src -> fst $ fromPurePersistValues proxy src
+  analyzeFunction name = do
+    result <- queryRaw' "SELECT param_list, returns, body_utf8 from mysql.proc WHERE db = coalesce(?, database()) AND name = ?" (toPurePersistValues proxy name []) id
+    let read' typ = readSqlType typ typ (Nothing, Nothing, Nothing)
+    return $ case result of
+      Nothing  -> Nothing
+      -- TODO: parse param_list
+      Just result' -> Just (Just [DbOther (OtherTypeDef [Left param_list])], if ret == "" then Nothing else Just $ read' ret, src) where
+        (param_list, ret, src) = fst . fromPurePersistValues proxy $ result'
+  getMigrationPack = fmap (migrationPack . fromJust) getCurrentSchema
 
 withMySQLPool :: (MonadBaseControl IO m, MonadIO m)
               => MySQL.ConnectInfo
@@ -162,7 +169,7 @@ insert' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) =>
 insert' v = do
   -- constructor number and the rest of the field values
   vals <- toEntityPersistValues' v
-  let e = entityDef v
+  let e = entityDef proxy v
   let constructorNum = fromPrimitivePersistValue proxy (head vals)
 
   liftM fst $ if isSimple (constructors e)
@@ -186,7 +193,7 @@ insert_' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) =
 insert_' v = do
   -- constructor number and the rest of the field values
   vals <- toEntityPersistValues' v
-  let e = entityDef v
+  let e = entityDef proxy v
   let constructorNum = fromPrimitivePersistValue proxy (head vals)
 
   if isSimple (constructors e)
@@ -204,11 +211,13 @@ insert_' v = do
 
 insertIntoConstructorTable :: Bool -> Utf8 -> ConstructorDef -> [PersistValue] -> RenderS db r
 insertIntoConstructorTable withId tName c vals = RenderS query vals' where
-  query = "INSERT INTO " <> tName <> "(" <> fieldNames <> ")VALUES(" <> placeholders <> ")"
+  query = "INSERT INTO " <> tName <> columnsValues
   fields = case constrAutoKeyName c of
-    Just idName | withId -> (idName, dbType (0 :: Int64)):constrParams c
+    Just idName | withId -> (idName, dbType proxy (0 :: Int64)):constrParams c
     _                    -> constrParams c
-  fieldNames   = renderFields escapeS fields
+  columnsValues = case foldr (flatten escapeS) [] fields of
+    [] -> "() VALUES ()"
+    xs -> "(" <> commasJoin xs <> ") VALUES(" <> placeholders <> ")"
   RenderS placeholders vals' = commasJoin $ map renderPersistValue vals
 
 insertList' :: forall m a.(MonadBaseControl IO m, MonadIO m, MonadLogger m, PersistField a) => [a] -> DbPersist MySQL m Int64
@@ -217,7 +226,7 @@ insertList' (l :: [a]) = do
   executeRaw' ("INSERT INTO " <> escapeS mainName <> "()VALUES()") []
   k <- getLastInsertId
   let valuesName = mainName <> delim' <> "values"
-  let fields = [("ord", dbType (0 :: Int)), ("value", dbType (undefined :: a))]
+  let fields = [("ord", dbType proxy (0 :: Int)), ("value", dbType proxy (undefined :: a))]
   let query = "INSERT INTO " <> escapeS valuesName <> "(id," <> renderFields escapeS fields <> ")VALUES(?," <> renderFields (const $ fromChar '?') fields <> ")"
   let go :: Int -> [a] -> DbPersist MySQL m ()
       go n (x:xs) = do
@@ -232,7 +241,7 @@ getList' :: forall m a.(MonadBaseControl IO m, MonadIO m, MonadLogger m, Persist
 getList' k = do
   let mainName = "List" <> delim' <> delim' <> fromString (persistName (undefined :: a))
   let valuesName = mainName <> delim' <> "values"
-  let value = ("value", dbType (undefined :: a))
+  let value = ("value", dbType proxy (undefined :: a))
   let query = "SELECT " <> renderFields escapeS [value] <> " FROM " <> escapeS valuesName <> " WHERE id=? ORDER BY ord"
   queryRaw' query [toPrimitivePersistValue proxy k] $ mapAllRows (liftM fst . fromPersistValues)
 
@@ -270,9 +279,7 @@ toEntityPersistValues' = liftM ($ []) . toEntityPersistValues
 
 migrate' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) => v -> Migration (DbPersist MySQL m)
 migrate' v = do
-  x <- lift $ queryRaw' "SELECT database()" [] id
-  let schema = fst $ fromPurePersistValues proxy $ fromJust x
-      migPack = migrationPack schema
+  migPack <- lift getMigrationPack
   migrateRecursively (migrateSchema migPack) (migrateEntity migPack) (migrateList migPack) v
 
 migrationPack :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => String -> GM.MigrationPack (DbPersist MySQL m)
@@ -289,8 +296,10 @@ migrationPack currentSchema = GM.MigrationPack
   mainTableId
   defaultPriority
   (\uniques refs -> ([], map AddUnique uniques ++ map AddReference refs))
+  showSqlType
   showColumn
   (showAlterDb currentSchema)
+  Restrict
   Restrict
 
 showColumn :: Column -> String
@@ -305,89 +314,91 @@ showColumn (Column n nu t def) = concat
         Just s  -> " DEFAULT " ++ s
     ]
 
-migTriggerOnDelete :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Maybe String -> String -> [(String, String)] -> DbPersist MySQL m (Bool, [AlterDB])
-migTriggerOnDelete schema name deletes = do
-  let addTrigger = AddTriggerOnDelete schema name schema name (concatMap snd deletes)
-  x <- analyzeTrigger schema name
+migTriggerOnDelete :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> [(String, String)] -> DbPersist MySQL m (Bool, [AlterDB])
+migTriggerOnDelete name deletes = do
+  let addTrigger = AddTriggerOnDelete name name (concatMap snd deletes)
+  x <- analyzeTrigger name
   return $ case x of
     Nothing | null deletes -> (False, [])
     Nothing -> (False, [addTrigger])
     Just sql -> (True, if null deletes -- remove old trigger if a datatype earlier had fields of ephemeral types
-      then [DropTrigger schema name schema name]
+      then [DropTrigger name name]
       else if sql == "BEGIN " ++ concatMap snd deletes ++ "END"
         then []
         -- this can happen when an ephemeral field was added or removed.
-        else [DropTrigger schema name schema name, addTrigger])
+        else [DropTrigger name name, addTrigger])
 
 -- | Schema name, table name and a list of field names and according delete statements
 -- assume that this function is called only for ephemeral fields
-migTriggerOnUpdate :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Maybe String -> String -> [(String, String)] -> DbPersist MySQL m [(Bool, [AlterDB])]
-migTriggerOnUpdate schema name deletes = do
-  let trigName = name ++ "_ON_UPDATE"
+migTriggerOnUpdate :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> [(String, String)] -> DbPersist MySQL m [(Bool, [AlterDB])]
+migTriggerOnUpdate tName deletes = do
+  let trigName = second (++ "_ON_UPDATE") tName
       f (fieldName, del) = "IF NOT (NEW." ++ escape fieldName ++ " <=> OLD." ++ escape fieldName ++ ") THEN " ++ del ++ " END IF;"
       trigBody = concatMap f deletes
-  let addTrigger = AddTriggerOnUpdate schema trigName schema name Nothing trigBody
-  x <- analyzeTrigger schema trigName
+  let addTrigger = AddTriggerOnUpdate trigName tName Nothing trigBody
+  x <- analyzeTrigger trigName
   return $ return $ case x of
     Nothing | null deletes -> (False, [])
     Nothing -> (False, [addTrigger])
     Just sql -> (True, if null deletes -- remove old trigger if a datatype earlier had fields of ephemeral types
-      then [DropTrigger schema trigName schema name]
+      then [DropTrigger trigName tName]
       else if sql == "BEGIN " ++ trigBody ++ "END"
         then []
         -- this can happen when an ephemeral field was added or removed.
-        else [DropTrigger schema trigName schema name, addTrigger])
+        else [DropTrigger trigName tName, addTrigger])
   
-analyzeTable' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Maybe String -> String -> DbPersist MySQL m (Maybe TableInfo)
-analyzeTable' schema name = do
-  table <- queryRaw' "SELECT * FROM information_schema.tables WHERE table_schema = coalesce(?, database()) AND table_name = ?" [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] id
+analyzeTable' :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> DbPersist MySQL m (Maybe TableInfo)
+analyzeTable' name = do
+  table <- queryRaw' "SELECT * FROM information_schema.tables WHERE table_schema = coalesce(?, database()) AND table_name = ?" (toPurePersistValues proxy name []) id
   case table of
     Just _ -> do
-      -- omit primary keys
-      let colQuery = "SELECT c.column_name, c.is_nullable, c.data_type, c.column_type, c.column_default, c.character_maximum_length, c.numeric_precision, c.numeric_scale\
+      let colQuery = "SELECT c.column_name, c.is_nullable, c.data_type, c.column_type, c.column_default, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.extra\
 \  FROM information_schema.columns c\
 \  WHERE c.table_schema = coalesce(?, database()) AND c.table_name=?\
 \  ORDER BY c.ordinal_position"
 
-      cols <- queryRaw' colQuery [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] (mapAllRows $ return . getColumn name . fst . fromPurePersistValues proxy)
+      cols <- queryRaw' colQuery (toPurePersistValues proxy name []) (mapAllRows $ return . first getColumn . fst . fromPurePersistValues proxy)
       -- MySQL has no difference between unique keys and indexes
       let constraintQuery = "SELECT u.constraint_name, u.column_name FROM information_schema.table_constraints tc INNER JOIN information_schema.key_column_usage u USING (constraint_catalog, constraint_schema, constraint_name, table_schema, table_name) WHERE tc.constraint_type=? AND tc.table_schema=coalesce(?,database()) AND u.table_name=? ORDER BY u.constraint_name, u.column_name"
-      uniqConstraints <- queryRaw' constraintQuery [toPrimitivePersistValue proxy ("UNIQUE" :: String), toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] (mapAllRows $ return . fst . fromPurePersistValues proxy)
-      uniqPrimary <- queryRaw' constraintQuery [toPrimitivePersistValue proxy ("PRIMARY KEY" :: String), toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy name] (mapAllRows $ return . fst . fromPurePersistValues proxy)
-      let mkUniqs typ = map (\us -> UniqueDef' (fst $ head us) typ (map snd us)) . groupBy ((==) `on` fst)
-      let uniqs = mkUniqs UniqueConstraint uniqConstraints ++ mkUniqs UniquePrimary uniqPrimary
-      references <- analyzeTableReferences schema name
-      return $ Just $ TableInfo cols uniqs references
+      uniqConstraints <- queryRaw' constraintQuery (toPurePersistValues proxy ("UNIQUE" :: String, name) []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+      uniqPrimary <- queryRaw' constraintQuery (toPurePersistValues proxy ("PRIMARY KEY" :: String, name) []) (mapAllRows $ return . fst . fromPurePersistValues proxy)
+      let mkUniqs typ = map (\us -> UniqueDef (fst $ head us) typ (map (Left . snd) us)) . groupBy ((==) `on` fst)
+          isAutoincremented = case filter (\c -> colName (fst c) `elem` map snd uniqPrimary) cols of
+                                [(c, extra)] -> colType c `elem` [DbInt32, DbInt64] && "auto_increment" `isInfixOf` (extra :: String)
+                                _ -> False
+          uniqs = mkUniqs UniqueConstraint uniqConstraints ++ mkUniqs (UniquePrimary isAutoincremented) uniqPrimary
+      references <- analyzeTableReferences name
+      return $ Just $ TableInfo (map fst cols) uniqs references
     Nothing -> return Nothing
 
-getColumn :: String -> ((String, String, String, String, Maybe String), (Maybe Int, Maybe Int, Maybe Int)) -> Column
-getColumn _ ((column_name, is_nullable, data_type, column_type, d), modifiers) = Column column_name (is_nullable == "YES") t d where
+getColumn :: ((String, String, String, String, Maybe String), (Maybe Int, Maybe Int, Maybe Int)) -> Column
+getColumn ((column_name, is_nullable, data_type, column_type, d), modifiers) = Column column_name (is_nullable == "YES") t d where
   t = readSqlType data_type column_type modifiers
 
-analyzeTableReferences :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Maybe String -> String -> DbPersist MySQL m [(Maybe String, Reference)]
-analyzeTableReferences schema tName = do
-  let sql = "SELECT tc.constraint_name, u.referenced_table_schema, u.referenced_table_name, rc.delete_rule, rc.update_rule, u.column_name, u.referenced_column_name FROM information_schema.table_constraints tc\
+analyzeTableReferences :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> DbPersist MySQL m [(Maybe String, Reference)]
+analyzeTableReferences name = do
+  let query = "SELECT tc.constraint_name, u.referenced_table_schema, u.referenced_table_name, rc.delete_rule, rc.update_rule, u.column_name, u.referenced_column_name FROM information_schema.table_constraints tc\
 \  INNER JOIN information_schema.key_column_usage u USING (constraint_catalog, constraint_schema, constraint_name, table_schema, table_name)\
 \  INNER JOIN information_schema.referential_constraints rc USING (constraint_catalog, constraint_schema, constraint_name)\
 \  WHERE tc.constraint_type='FOREIGN KEY' AND tc.table_schema=coalesce(?, database()) AND tc.table_name=?\
 \  ORDER BY tc.constraint_name"
-  x <- queryRaw' sql [toPrimitivePersistValue proxy schema, toPrimitivePersistValue proxy tName] $ mapAllRows (return . fst . fromPurePersistValues proxy)
+  x <- queryRaw' query (toPurePersistValues proxy name []) $ mapAllRows (return . fst . fromPurePersistValues proxy)
   -- (refName, ((parentTableSchema, parentTable, onDelete, onUpdate), (childColumn, parentColumn)))
-  let mkReference xs = (Just refName, Reference parentSchema parentTable pairs (mkAction onDelete) (mkAction onUpdate)) where
+  let mkReference xs = (Just refName, Reference parentTable pairs (mkAction onDelete) (mkAction onUpdate)) where
         pairs = map (snd . snd) xs
-        (refName, ((parentSchema, parentTable, onDelete, onUpdate), _)) = head xs
+        (refName, ((parentTable, onDelete, onUpdate), _)) = head xs
         mkAction c = Just $ fromMaybe (error $ "unknown reference action type: " ++ c) $ readReferenceAction c
       references = map mkReference $ groupBy ((==) `on` fst) x
   return references
 
 showAlterDb :: String -> AlterDB -> SingleMigration
 showAlterDb _ (AddTable s) = Right [(False, defaultPriority, s)]
-showAlterDb currentSchema (AlterTable sch t _ _ _ alts) = Right $ concatMap (showAlterTable currentSchema $ withSchema sch t) alts
-showAlterDb _ (DropTrigger schTrg trigName _ _) = Right [(False, triggerPriority, "DROP TRIGGER " ++ withSchema schTrg trigName)]
-showAlterDb _ (AddTriggerOnDelete schTrg trigName schTbl tName body) = Right [(False, triggerPriority, "CREATE TRIGGER " ++ withSchema schTrg trigName ++ " AFTER DELETE ON " ++ withSchema schTbl tName ++ " FOR EACH ROW BEGIN " ++ body ++ "END")]
-showAlterDb _ (AddTriggerOnUpdate schTrg trigName schTbl tName _ body) = Right [(False, triggerPriority, "CREATE TRIGGER " ++ withSchema schTrg trigName ++ " AFTER UPDATE ON " ++ withSchema schTbl tName ++ " FOR EACH ROW BEGIN " ++ body ++ "END")]
+showAlterDb currentSchema (AlterTable t _ _ _ alts) = Right $ concatMap (showAlterTable currentSchema $ withSchema t) alts
+showAlterDb _ (DropTrigger trigName _) = Right [(False, triggerPriority, "DROP TRIGGER " ++ withSchema trigName)]
+showAlterDb _ (AddTriggerOnDelete trigName tName body) = Right [(False, triggerPriority, "CREATE TRIGGER " ++ withSchema trigName ++ " AFTER DELETE ON " ++ withSchema tName ++ " FOR EACH ROW BEGIN " ++ body ++ "END")]
+showAlterDb _ (AddTriggerOnUpdate trigName tName _ body) = Right [(False, triggerPriority, "CREATE TRIGGER " ++ withSchema trigName ++ " AFTER UPDATE ON " ++ withSchema tName ++ " FOR EACH ROW BEGIN " ++ body ++ "END")]
 showAlterDb _ (CreateOrReplaceFunction s) = Right [(False, functionPriority, s)]
-showAlterDb _ (DropFunction sch funcName) = Right [(False, functionPriority, "DROP FUNCTION " ++ withSchema sch funcName ++ "()")]
+showAlterDb _ (DropFunction funcName) = Right [(False, functionPriority, "DROP FUNCTION " ++ withSchema funcName ++ "()")]
 showAlterDb _ (CreateSchema sch ifNotExists) = Right [(False, schemaPriority, "CREATE DATABASE " ++ ifNotExists' ++ escape sch)] where
   ifNotExists' = if ifNotExists then "IF NOT EXISTS " else ""
 
@@ -427,31 +438,31 @@ showAlterTable _ table (AlterColumn col alts) = change ++ updates' where
       ])]
     f _ = []
   (updates, other) = partition (\a -> case a of UpdateValue _ -> True; _ -> False) alts
-showAlterTable _ table (AddUnique (UniqueDef' uName UniqueConstraint cols)) = [(False, defaultPriority, concat
+showAlterTable _ table (AddUnique (UniqueDef uName UniqueConstraint cols)) = [(False, defaultPriority, concat
   [ "ALTER TABLE "
   , table
   , " ADD"
   , maybe "" ((" CONSTRAINT " ++) . escape) uName
   , " UNIQUE("
-  , intercalate "," $ map escape cols
+  , intercalate "," $ map (either escape id) cols
   , ")"
   ])]
-showAlterTable _ table (AddUnique (UniqueDef' uName UniqueIndex cols)) = [(False, defaultPriority, concat
+showAlterTable _ table (AddUnique (UniqueDef uName UniqueIndex cols)) = [(False, defaultPriority, concat
   [ "CREATE UNIQUE INDEX "
   , maybe (error $ "showAlterTable: index for table " ++ table ++ " does not have a name") escape uName
   , " ON "
   , table
   , "("
-  , intercalate "," $ map escape cols
+  , intercalate "," $ map (either escape id) cols
   , ")"
   ])]
-showAlterTable _ table (AddUnique (UniqueDef' uName UniquePrimary cols)) = [(False, defaultPriority, concat
+showAlterTable _ table (AddUnique (UniqueDef uName (UniquePrimary _) cols)) = [(False, defaultPriority, concat
   [ "ALTER TABLE "
   , table
   , " ADD"
   , maybe "" ((" CONSTRAINT " ++) . escape) uName
   , " PRIMARY KEY("
-  , intercalate "," $ map escape cols
+  , intercalate "," $ map (either escape id) cols
   , ")"
   ])]
 showAlterTable _ table (DropConstraint uName) = [(False, defaultPriority, concat
@@ -464,13 +475,13 @@ showAlterTable _ _ (DropIndex uName) = [(False, defaultPriority, concat
   [ "DROP INDEX "
   , escape uName
   ])]
-showAlterTable currentSchema table (AddReference (Reference schema tName columns onDelete onUpdate)) = [(False, referencePriority, concat
+showAlterTable currentSchema table (AddReference (Reference tName columns onDelete onUpdate)) = [(False, referencePriority, concat
   [ "ALTER TABLE "
   , table
   , " ADD FOREIGN KEY("
   , our
   , ") REFERENCES "
-  , escape (fromMaybe currentSchema schema) ++ "." ++ escape tName
+  , withSchema $ first (<|> Just currentSchema) tName
   , "("
   , foreign
   , ")"
@@ -497,7 +508,7 @@ readSqlType typ colTyp (_, numeric_precision, numeric_scale) = (case typ of
   "time" -> DbTime
   _ | typ `elem` ["datetime", "timestamp"] -> DbDayTime
   _ | typ `elem` ["date", "newdate", "year"] -> DbDay
-  _ -> DbOther $ OtherTypeDef $ const colTyp
+  _ -> DbOther $ OtherTypeDef [Left colTyp]
   ) where
     numAttrs = (numeric_precision, numeric_scale)
 
@@ -513,17 +524,14 @@ showSqlType t = case t of
   DbDayTime -> "DATETIME"
   DbDayTimeZoned -> "VARCHAR(50) CHARACTER SET utf8"
   DbBlob -> "BLOB"
-  DbOther (OtherTypeDef f) -> f showSqlType
-  DbAutoKey -> showSqlType DbInt64
+  DbOther (OtherTypeDef ts) -> concatMap (either id showSqlType) ts
 
-compareUniqs :: UniqueDef' -> UniqueDef' -> Bool
-compareUniqs (UniqueDef' _ UniquePrimary cols1) (UniqueDef' _ UniquePrimary cols2) = haveSameElems (==) cols1 cols2
--- only one of the uniques is primary
-compareUniqs (UniqueDef' _ type1 _) (UniqueDef' _ type2 _) | UniquePrimary `elem` [type1, type2] = False
-compareUniqs (UniqueDef' name1 _ cols1) (UniqueDef' name2 _ cols2) = fromMaybe True (liftM2 (==) name1 name2) && haveSameElems (==) cols1 cols2
+compareUniqs :: UniqueDefInfo -> UniqueDefInfo -> Bool
+compareUniqs (UniqueDef _ (UniquePrimary _) cols1) (UniqueDef _ (UniquePrimary _) cols2) = haveSameElems (==) cols1 cols2
+compareUniqs (UniqueDef name1 _ cols1) (UniqueDef name2 _ cols2) = fromMaybe True (liftM2 (==) name1 name2) && haveSameElems (==) cols1 cols2
 
 compareRefs :: String -> (Maybe String, Reference) -> (Maybe String, Reference) -> Bool
-compareRefs currentSchema (_, Reference sch1 tbl1 pairs1 onDel1 onUpd1) (_, Reference sch2 tbl2 pairs2 onDel2 onUpd2) =
+compareRefs currentSchema (_, Reference (sch1, tbl1) pairs1 onDel1 onUpd1) (_, Reference (sch2, tbl2) pairs2 onDel2 onUpd2) =
      fromMaybe currentSchema sch1 == fromMaybe currentSchema sch2
   && unescape tbl1 == unescape tbl2
   && haveSameElems (==) pairs1 pairs2
@@ -534,7 +542,7 @@ compareRefs currentSchema (_, Reference sch1 tbl1 pairs1 onDel1 onUpd1) (_, Refe
 compareTypes :: DbTypePrimitive -> DbTypePrimitive -> Bool
 compareTypes type1 type2 = f type1 == f type2 where
   f = map toUpper . showSqlType . hack
-  hack DbDayTimeZoned = DbOther $ OtherTypeDef $ const "VARCHAR(50)"
+  hack DbDayTimeZoned = DbOther $ OtherTypeDef [Left "VARCHAR(50)"]
   hack t = t
 
 compareDefaults :: String -> String -> Bool
@@ -655,5 +663,8 @@ proxy = error "proxy MySQL"
 noLimit :: Utf8
 noLimit = "LIMIT 18446744073709551615"
 
-withSchema :: Maybe String -> String -> String
-withSchema sch name = maybe "" (\x -> escape x ++ ".") sch ++ escape name
+withSchema :: QualifiedName -> String
+withSchema (sch, name) = maybe "" (\x -> escape x ++ ".") sch ++ escape name
+
+preColumns :: HasSelectOptions opts db r => opts -> RenderS db r
+preColumns _ = mempty

@@ -45,7 +45,7 @@ import Database.Groundhog.Generic.Sql
 import Database.Groundhog.Instances ()
 
 import Control.Applicative
-import Data.Attoparsec.Char8
+import Data.Attoparsec.ByteString.Char8
 
 data Point = Point Double Double deriving (Eq, Show)
 -- | It is not fully implemented in PostgreSQL yet. It is kept just to match all geometric types.
@@ -80,7 +80,7 @@ instance PersistField Point where
   persistName _ = "Point"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "point") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "point"]) False Nothing Nothing
 
 instance PrimitivePersistField Line where
   toPrimitivePersistValue _ (Line (Point x1 y1) (Point x2 y2)) = PersistString $ show ((x1, y1), (x2, y2))
@@ -90,7 +90,7 @@ instance PersistField Line where
   persistName _ = "Line"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "line") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "line"]) False Nothing Nothing
 
 instance PrimitivePersistField Lseg where
   toPrimitivePersistValue _ (Lseg (Point x1 y1) (Point x2 y2)) = PersistString $ show ((x1, y1), (x2, y2))
@@ -100,7 +100,7 @@ instance PersistField Lseg where
   persistName _ = "Lseg"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "lseg") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "lseg"]) False Nothing Nothing
 
 instance PrimitivePersistField Box where
   toPrimitivePersistValue _ (Box (Point x1 y1) (Point x2 y2)) = PersistString $ show ((x1, y1), (x2, y2))
@@ -110,7 +110,7 @@ instance PersistField Box where
   persistName _ = "Box"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "box") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "box"]) False Nothing Nothing
 
 showPath :: Char -> Char -> [Point] -> ShowS
 showPath open close []     s = open : close : s
@@ -133,7 +133,7 @@ instance PersistField Path where
   persistName _ = "Path"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "path") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "path"]) False Nothing Nothing
 
 instance PrimitivePersistField Polygon where
   toPrimitivePersistValue _ (Polygon ps) = PersistString $ showPath '(' ')' ps ""
@@ -143,7 +143,7 @@ instance PersistField Polygon where
   persistName _ = "Polygon"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "polygon") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "polygon"]) False Nothing Nothing
 
 instance PrimitivePersistField Circle where
   toPrimitivePersistValue _ (Circle (Point x1 y1) r) = PersistString $ show ((x1, y1), r)
@@ -153,7 +153,7 @@ instance PersistField Circle where
   persistName _ = "Circle"
   toPersistValues = primToPersistValue
   fromPersistValues = primFromPersistValue
-  dbType _ = DbTypePrimitive (DbOther $ OtherTypeDef $ const "circle") False Nothing Nothing
+  dbType _ _ = DbTypePrimitive (DbOther $ OtherTypeDef $ [Left "circle"]) False Nothing Nothing
 
 class BoxLineLseg a
 instance BoxLineLseg Box
@@ -251,10 +251,10 @@ instance Intersects Lseg Line
 instance Intersects Lseg Lseg
 instance Intersects Path Path
 
-psqlOperatorExpr :: (SqlDb db, QueryRaw db ~ Snippet db, Expression db r a, Expression db r b) => String -> a -> b -> Expr db r c
+psqlOperatorExpr :: (SqlDb db, Expression db r a, Expression db r b) => String -> a -> b -> Expr db r c
 psqlOperatorExpr op x y = mkExpr $ operator 50 op x y
 
-psqlOperatorCond :: (SqlDb db, QueryRaw db ~ Snippet db, Expression db r a, Expression db r b) => String -> a -> b -> Cond db r
+psqlOperatorCond :: (SqlDb db, Expression db r a, Expression db r b) => String -> a -> b -> Cond db r
 psqlOperatorCond op x y = CondRaw $ operator 50 op x y
 
 
@@ -265,25 +265,25 @@ infixl 7 /.
 -- | Translation
 -- 
 -- @box '((0,0),(1,1))' + point '(2.0,0)' = box '(3,1),(2,0)'@
-(+.) :: (SqlDb db, QueryRaw db ~ Snippet db, Plus a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r a
+(+.) :: (SqlDb db, Plus a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r a
 x +. y = mkExpr $ operator 60 "+" x y
 
 -- | Translation
 -- 
 -- @box '((0,0),(1,1))' - point '(2.0,0)' = box '(-1,1),(-2,0)'@
-(-.) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
+(-.) :: (SqlDb db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
 x -. y = mkExpr $ operator 60 "-" x y
 
 -- | Scaling/rotation
 -- 
 -- @box '((0,0),(1,1))' * point '(2.0,0)' = box '(2,2),(0,0)'@
-(*.) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
+(*.) :: (SqlDb db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
 x *. y = mkExpr $ operator 70 "*" x y
 
 -- | Scaling/rotation
 -- 
 -- @box '((0,0),(2,2))' / point '(2.0,0)' = box '(1,1),(0,0)'@
-(/.) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
+(/.) :: (SqlDb db, BoxCirclePathPoint a, ExpressionOf db r x a, ExpressionOf db r y Point) => x -> y -> Expr db r a
 x /. y = mkExpr $ operator 70 "/" x y
 
 -- | Point or box of intersection
@@ -291,129 +291,129 @@ x /. y = mkExpr $ operator 70 "/" x y
 -- @lseg '((1,-1),(-1,1))' # '((1,1),(-1,-1))' = point '(0,0)'@
 --
 -- @box '((1,-1),(-1,1))' # '((1,1),(-1,-1))' = box '(1,1),(-1,-1)'@
-(#) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxLineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Expr db r a
+(#) :: (SqlDb db, BoxLineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Expr db r a
 (#) = psqlOperatorExpr "#"
 
 -- | Closest point to first operand on second operand
 -- 
 -- @point '(0,0)' ## lseg '((2,0),(0,2))' = point '(1,1)'@
-(##) :: (SqlDb db, QueryRaw db ~ Snippet db, Closest a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r Point
+(##) :: (SqlDb db, Closest a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r Point
 (##) = psqlOperatorExpr "##"
 
 -- | Distance between
 -- 
 -- @circle '((0,0),1)' <-> circle '((5,0),1)' = 3@
-(<->) :: (SqlDb db, QueryRaw db ~ Snippet db, Distance a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r Double
+(<->) :: (SqlDb db, Distance a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Expr db r Double
 (<->) = psqlOperatorExpr "<->"
 
 -- | Overlaps?
 -- 
 -- @box '((0,0),(1,1))' && box '((0,0),(2,2))' = true@
-(&&) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(&&) :: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (&&) = psqlOperatorCond "&&"
 
 -- | Is strictly left of?
 -- 
 -- @circle '((0,0),1)' << circle '((5,0),1)' = true@
-(<<) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(<<) :: (SqlDb db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (<<) = psqlOperatorCond "<<"
 
 -- | Is strictly right of?
 -- 
 -- @circle '((5,0),1)' >> circle '((0,0),1)' = true@
-(>>) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(>>) :: (SqlDb db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (>>) = psqlOperatorCond ">>"
 
 -- | Does not extend to the right of? box '((0,0),(1,1))' &< box '((0,0),(2,2))' = t
-(&<) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(&<) :: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (&<) = psqlOperatorCond "&<"
 
 -- | Does not extend to the left of?
 -- 
 -- @box '((0,0),(3,3))' &> box '((0,0),(2,2))' = true@
-(&>) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(&>) :: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (&>) = psqlOperatorCond "&>"
 
 -- | Is strictly below?
 -- 
 -- @box '((0,0),(3,3))' <<| box '((3,4),(5,5))' = true@
-(<<|) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(<<|) :: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (<<|) = psqlOperatorCond "<<|"
 
 -- | Is strictly above?
 -- 
 -- @box '((3,4),(5,5))' |>> box '((0,0),(3,3))'@
-(|>>):: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(|>>):: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (|>>) = psqlOperatorCond "|>>"
 
 -- | Does not extend above?
 -- 
 -- @box '((0,0),(1,1))' &<| box '((0,0),(2,2))' = true@
-(&<|):: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(&<|):: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (&<|) = psqlOperatorCond "&<|"
 
 -- | Does not extend below?
 -- 
 -- @box '((0,0),(3,3))' |&> box '((0,0),(2,2))' = true@
-(|&>) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(|&>) :: (SqlDb db, BoxCirclePolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (|&>) = psqlOperatorCond "|&>"
 
 -- | Is below (allows touching)?
 -- 
 -- @circle '((0,0),1)' <^ circle '((0,5),1)' = true@
-(<^) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxPoint a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(<^) :: (SqlDb db, BoxPoint a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (<^) = psqlOperatorCond "<^"
 
 -- | Is above (allows touching)?
 -- 
 -- @circle '((0,5),1)' >^ circle '((0,0),1)' = true@
-(>^) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxPoint a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(>^) :: (SqlDb db, BoxPoint a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (>^) = psqlOperatorCond ">^"
 
 -- | Intersects?
 -- 
 -- @lseg '((-1,0),(1,0))' ?# box '((-2,-2),(2,2))' = true@
-(?#) :: (SqlDb db, QueryRaw db ~ Snippet db, Intersects a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
+(?#) :: (SqlDb db, Intersects a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
 (?#) = psqlOperatorCond "?#"
 
 -- | Are horizontally aligned?
 -- 
 -- @point '(1,0)' ?- point '(0,0)' = true@
-(?-) :: (SqlDb db, QueryRaw db ~ Snippet db, ExpressionOf db r x Point, ExpressionOf db r y Point) => x -> y -> Cond db r
+(?-) :: (SqlDb db, ExpressionOf db r x Point, ExpressionOf db r y Point) => x -> y -> Cond db r
 (?-) = psqlOperatorCond "?-"
 
 -- | Are vertically aligned?
 -- 
 -- @point '(0,1)' ?| point '(0,0)' = true@
-(?|) :: (SqlDb db, QueryRaw db ~ Snippet db, ExpressionOf db r x Point, ExpressionOf db r y Point) => x -> y -> Cond db r
+(?|) :: (SqlDb db, ExpressionOf db r x Point, ExpressionOf db r y Point) => x -> y -> Cond db r
 (?|) = psqlOperatorCond "?|"
 
 -- | Is perpendicular?
 -- 
 -- @lseg '((0,0),(0,1))' ?-| lseg '((0,0),(1,0))' = true@
-(?-|) :: (SqlDb db, QueryRaw db ~ Snippet db, LineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(?-|) :: (SqlDb db, LineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (?-|) = psqlOperatorCond "?-|"
 
 -- | Are parallel?
 -- 
 -- @lseg '((-1,0),(1,0))' ?|| lseg '((-1,2),(1,2))' = true@
-(?||) :: (SqlDb db, QueryRaw db ~ Snippet db, LineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(?||) :: (SqlDb db, LineLseg a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (?||) = psqlOperatorCond "?||"
 
 -- | Contains?
 -- 
 -- @circle '((0,0),2)' \@> point '(1,1)' = true@
-(@>) :: (SqlDb db, QueryRaw db ~ Snippet db, Contains a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
+(@>) :: (SqlDb db, Contains a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
 (@>) = psqlOperatorCond "@>"
 
 -- | Contained in or on?
 -- 
 -- @point '(1,1)' <\@ circle '((0,0),2)' = true@
-(<@) :: (SqlDb db, QueryRaw db ~ Snippet db, Contained a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
+(<@) :: (SqlDb db, Contained a b, ExpressionOf db r x a, ExpressionOf db r y b) => x -> y -> Cond db r
 (<@) = psqlOperatorCond "<@"
 
 -- | Same as?
 -- 
 -- @polygon '((0,0),(1,1))' ~= polygon '((1,1),(0,0))' = true@
-(~=) :: (SqlDb db, QueryRaw db ~ Snippet db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
+(~=) :: (SqlDb db, BoxCirclePointPolygon a, ExpressionOf db r x a, ExpressionOf db r y a) => x -> y -> Cond db r
 (~=) = psqlOperatorCond "~="
