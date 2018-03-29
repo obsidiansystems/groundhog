@@ -48,14 +48,16 @@ import Data.Int (Int64)
 import Data.IORef
 import Data.List (groupBy, intercalate, isPrefixOf, stripPrefix)
 import Data.Maybe (fromJust, fromMaybe, isJust, mapMaybe)
-import Data.Monoid
 import Data.Pool
 import Data.Time.LocalTime (localTimeToUTC, utc)
 import qualified Data.Map as Map
 import Data.Map (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Data.Text (Text)
+import Data.Scientific (Scientific, fromFloatDigits)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
+import Text.Read (readMaybe)
 
 -- typical operations for connection: OPEN, BEGIN, COMMIT, ROLLBACK, CLOSE
 newtype Postgresql = Postgresql PG.Connection
@@ -267,7 +269,7 @@ insertList' (l :: [a]) = do
       go _ [] = return ()
   go 0 l
   return $ fromPrimitivePersistValue proxy k
-  
+
 getList' :: forall m a.(MonadBaseControl IO m, MonadIO m, MonadLogger m, PersistField a) => Int64 -> DbPersist Postgresql m [a]
 getList' k = do
   let mainName = "List" <> delim' <> delim' <> fromString (persistName (undefined :: a))
@@ -379,7 +381,7 @@ migTriggerOnDelete tName deletes = do
             -- this can happen when an ephemeral field was added or removed.
             else [DropTrigger trigName tName, addTrigger])
   return (trigExisted, funcMig ++ trigMig)
-      
+
 -- | Table name and a list of field names and according delete statements
 -- assume that this function is called only for ephemeral fields
 migTriggerOnUpdate :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => QualifiedName -> [(String, String)] -> DbPersist Postgresql m [(Bool, [AlterDB])]
@@ -732,7 +734,7 @@ mainTableId = "id"
 -- It is used to escape table names and columns, which can include only symbols allowed in Haskell datatypes and '$' delimiter. We need it mostly to support names that coincide with SQL keywords
 escape :: String -> String
 escape s = '\"' : s ++ "\""
-  
+
 getStatement :: Utf8 -> PG.Query
 getStatement sql = PG.Query $ fromUtf8 sql
 
@@ -848,8 +850,8 @@ withSchema :: QualifiedName -> String
 withSchema (sch, name) = maybe "" (\x -> escape x ++ ".") sch ++ escape name
 
 -- | Put explicit type for expression. It is useful for values which are defaulted to a wrong type.
--- For example, a literal Int from a 64bit machine can be defaulted to a 32bit int by Postgresql. 
--- Also a value entered as an external string (geometry, arrays and other complex types have this representation) may need an explicit type. 
+-- For example, a literal Int from a 64bit machine can be defaulted to a 32bit int by Postgresql.
+-- Also a value entered as an external string (geometry, arrays and other complex types have this representation) may need an explicit type.
 explicitType :: (Expression Postgresql r a, PersistField a) => a -> Expr Postgresql r a
 explicitType a = castType a t where
   t = case dbType proxy a of
@@ -873,3 +875,25 @@ preColumns opts = clause where
     Nothing -> mempty
     Just (Snippet snippet) -> f $ head $ snippet renderConfig 0
   opts' = dbSpecificOptions $ getSelectOptions opts
+
+
+instance PersistField Scientific where
+  persistName _ = "Scientific"
+  toPersistValues = primToPersistValue
+  fromPersistValues = primFromPersistValue
+  dbType _ _ = DbTypePrimitive
+    (DbOther (OtherTypeDef [Left "numeric"]))
+    True
+    Nothing
+    Nothing
+
+instance PrimitivePersistField Scientific where
+  toPrimitivePersistValue  _ n = PersistCustom (Utf8 $ fromString $ show n <> "::numeric") []
+  fromPrimitivePersistValue _ (PersistCustom pv _) = fromMaybe
+    (error $ "fromPrimitivePersistValue: Could not parse Scientific: " ++ show pv)
+    $ either (const Nothing) (readMaybe . T.unpack) $ T.decodeUtf8' $ fromUtf8 pv
+  fromPrimitivePersistValue _ (PersistInt64 v) = fromIntegral v
+  fromPrimitivePersistValue _ (PersistDouble v) = fromFloatDigits v
+  fromPrimitivePersistValue _ pv = error $ "fromPrimitivePersistValue: Unexpected PersistValue when trying to parse Scientific: " ++ show pv
+
+instance NeverNull Scientific
