@@ -1,9 +1,10 @@
 {-# LANGUAGE GADTs, TypeFamilies, ExistentialQuantification, MultiParamTypeClasses, FunctionalDependencies, FlexibleContexts, FlexibleInstances, GeneralizedNewtypeDeriving, EmptyDataDecls, ConstraintKinds, CPP, UndecidableSuperClasses #-}
 {-# LANGUAGE UndecidableInstances #-} -- Required for Projection'
+{-# LANGUAGE StandaloneDeriving #-}
 -- | This module defines the functions and datatypes used throughout the framework.
 -- Most of them are for the internal use
 module Database.Groundhog.Core
-  ( 
+  (
   -- * Main types
     PersistEntity(..)
   , PersistValue(..)
@@ -89,10 +90,14 @@ import Control.Monad.Base (MonadBase (liftBase))
 import Control.Monad.Logger (MonadLogger(..))
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class (MonadIO(..))
+import qualified Control.Monad.State as S
+import qualified Control.Monad.State.Strict as Strict
 import Control.Monad.Trans.Control (MonadBaseControl (..), ComposeSt, defaultLiftBaseWith, defaultRestoreM, MonadTransControl (..))
+import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Reader (ReaderT(..), runReaderT, mapReaderT)
 import Control.Monad.Trans.State (StateT)
 import Control.Monad.Reader (MonadReader(..))
+import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, mask, uninterruptibleMask)
 import Control.Monad (liftM)
 import qualified Control.Monad.Cont.Class as Mtl
 import qualified Control.Monad.Error.Class as Mtl
@@ -283,6 +288,7 @@ instance MonadBaseControl IO m => MonadBaseControl IO (DbPersist conn m) where
   restoreM     = defaultRestoreM   unStMSP
 #endif
 
+
 instance MonadLogger m => MonadLogger (DbPersist conn m) where
   monadLoggerLog a b c = lift . monadLoggerLog a b c
 
@@ -312,6 +318,14 @@ instance Mtl.MonadState s m => Mtl.MonadState s (DbPersist conn m) where
   get = lift Mtl.get
   put = lift . Mtl.put
   state = lift . Mtl.state
+
+deriving instance MonadThrow m => MonadThrow (DbPersist conn m)
+deriving instance MonadCatch m => MonadCatch (DbPersist conn m)
+instance MonadMask m => MonadMask (DbPersist conn m) where
+  mask a = DbPersist $ ReaderT $ \e -> mask $ \u -> runReaderT (unDbPersist (a $ q u)) e
+    where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
+  uninterruptibleMask a = DbPersist $ ReaderT $ \e -> uninterruptibleMask $ \u -> runReaderT (unDbPersist (a $ q u)) e
+    where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
 
 class PrimitivePersistField (AutoKeyType db) => DbDescriptor db where
   -- | Type of the database default autoincremented key. For example, Sqlite has Int64
@@ -381,6 +395,122 @@ class (Monad m, DbDescriptor (PhantomDb m)) => PersistBackend m where
                 -> m a
   insertList    :: PersistField a => [a] -> m Int64
   getList       :: PersistField a => Int64 -> m [a]
+
+
+instance PersistBackend m => PersistBackend (ReaderT r m) where --TODO: Abstract this newtype-wrapper-monad-stack stuff
+  type PhantomDb (ReaderT r m) = PhantomDb m
+  type TableAnalysis (ReaderT r m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    k <- ask
+    lift $ queryRaw c q p $ \rp -> runReaderT (f $ lift rp) k
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (StateT s m) where
+  type PhantomDb (StateT s m) = PhantomDb m
+  type TableAnalysis (StateT s m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    k <- S.get
+    (a, s) <- lift $ queryRaw c q p $ \rp -> S.runStateT (f $ lift rp) k
+    S.put s >> return a
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (Strict.StateT s m) where
+  type PhantomDb (Strict.StateT s m) = PhantomDb m
+  type TableAnalysis (Strict.StateT s m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    k <- Strict.get
+    (a, s) <- lift $ queryRaw c q p $ \rp -> Strict.runStateT (f $ lift rp) k
+    Strict.put s >> return a
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (MaybeT m) where
+  type PhantomDb (MaybeT m) = PhantomDb m
+  type TableAnalysis (MaybeT m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    ma <- lift $ queryRaw c q p $ \rp -> runMaybeT (f $ lift rp)
+    MaybeT (return ma)
+  insertList = lift . insertList
+  getList = lift . getList
+
 
 type RowPopper m = m (Maybe [PersistValue])
 
@@ -485,14 +615,14 @@ data DbTypePrimitive' str =
 
 type DbTypePrimitive = DbTypePrimitive' String
 
-data DbType = 
+data DbType =
     -- | type, nullable, default value, reference
       DbTypePrimitive DbTypePrimitive Bool (Maybe String) (Maybe ParentTableReference)
     | DbEmbedded EmbeddedDef (Maybe ParentTableReference)
     | DbList String DbType -- ^ List table name and type of its argument
   deriving (Eq, Show)
 
--- | The reference contains either EntityDef of the parent table and name of the unique constraint. Or for tables not mapped by Groundhog schema name, table name, and list of columns  
+-- | The reference contains either EntityDef of the parent table and name of the unique constraint. Or for tables not mapped by Groundhog schema name, table name, and list of columns
 -- Reference to the autogenerated key of a mapped entity = (Left (entityDef, Nothing), onDelete, onUpdate)
 -- Reference to a unique key of a mapped entity = (Left (entityDef, Just uniqueKeyName), onDelete, onUpdate)
 -- Reference to a table that is not mapped = (Right ((schema, tableName), columns), onDelete, onUpdate)
