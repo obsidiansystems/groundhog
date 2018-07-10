@@ -57,9 +57,12 @@ data RenderS db r = RenderS {
   , getValues :: [PersistValue] -> [PersistValue]
 }
 
+instance Semigroup Utf8 where
+  Utf8 a <> Utf8 b = Utf8 $ a <> b
+
 instance Monoid Utf8 where
   mempty = Utf8 mempty
-  mappend (Utf8 a) (Utf8 b) = Utf8 (mappend a b)
+  mappend = (<>)
 
 instance IsString Utf8 where
   fromString = Utf8 . B.fromString
@@ -137,9 +140,12 @@ renderPersistValue :: PersistValue -> RenderS db r
 renderPersistValue (PersistCustom s as) = RenderS s (as++)
 renderPersistValue a = RenderS (fromChar '?') (a:)
 
+instance Semigroup (RenderS db r) where
+  RenderS f1 g1 <> RenderS f2 g2 = RenderS (f1 <> f2) (g1 . g2)
+
 instance Monoid (RenderS db r) where
   mempty = RenderS mempty id
-  (RenderS f1 g1) `mappend` (RenderS f2 g2) = RenderS (f1 `mappend` f2) (g1 . g2)
+  mappend = (<>)
 
 instance IsString (RenderS db r) where
   fromString s = RenderS (fromString s) id
