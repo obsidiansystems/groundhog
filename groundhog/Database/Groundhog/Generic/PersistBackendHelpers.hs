@@ -29,7 +29,7 @@ import Database.Groundhog.Generic.Sql
 import Control.Monad (liftM, forM, (>=>))
 import Data.Either (rights)
 import Data.Maybe (catMaybes, fromJust, mapMaybe)
-import Data.Monoid
+import Data.Monoid hiding ((<>))
 
 {-# INLINABLE get #-}
 get :: forall m v . (PersistBackend m, PersistEntity v, PrimitivePersistField (Key v BackendSpecific))
