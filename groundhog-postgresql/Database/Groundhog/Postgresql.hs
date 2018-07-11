@@ -61,7 +61,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Text.Read (readMaybe)
 
--- work around for no Semigroup instance og PG.Query prior to
+-- work around for no Semigroup instance of PG.Query prior to
 -- postgresql-simple 0.5.3.0
 import qualified Data.ByteString as B
 
