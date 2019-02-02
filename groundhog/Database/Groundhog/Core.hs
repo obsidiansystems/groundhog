@@ -94,6 +94,7 @@ import qualified Control.Monad.State as S
 import qualified Control.Monad.State.Strict as Strict
 import Control.Monad.Trans.Control (MonadBaseControl (..), ComposeSt, defaultLiftBaseWith, defaultRestoreM, MonadTransControl (..))
 import Control.Monad.Trans.Maybe (MaybeT(..))
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Control.Monad.Trans.Reader (ReaderT(..), runReaderT, mapReaderT)
 import Control.Monad.Trans.State (StateT)
 import Control.Monad.Reader (MonadReader(..))
@@ -508,6 +509,34 @@ instance PersistBackend m => PersistBackend (MaybeT m) where
   queryRaw c q p f = do
     ma <- lift $ queryRaw c q p $ \rp -> runMaybeT (f $ lift rp)
     MaybeT (return ma)
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (ExceptT e m) where
+  type PhantomDb (ExceptT e m) = PhantomDb m
+  type TableAnalysis (ExceptT e m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    ma <- lift $ queryRaw c q p $ \rp -> runExceptT (f $ lift rp)
+    ExceptT (return ma)
   insertList = lift . insertList
   getList = lift . getList
 
