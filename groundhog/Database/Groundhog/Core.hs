@@ -87,7 +87,7 @@ module Database.Groundhog.Core
 import Blaze.ByteString.Builder (Builder, fromByteString, toByteString)
 import Control.Applicative (Applicative)
 import Control.Monad.Base (MonadBase (liftBase))
-import Control.Monad.Logger (MonadLogger(..))
+import Control.Monad.Logger (MonadLogger(..), MonadLoggerIO (..))
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class (MonadIO(..))
 import qualified Control.Monad.State as S
@@ -292,6 +292,9 @@ instance MonadBaseControl IO m => MonadBaseControl IO (DbPersist conn m) where
 
 instance MonadLogger m => MonadLogger (DbPersist conn m) where
   monadLoggerLog a b c = lift . monadLoggerLog a b c
+
+instance MonadLoggerIO m => MonadLoggerIO (DbPersist conn m) where
+  askLoggerIO = lift askLoggerIO
 
 runDbPersist :: Monad m => DbPersist conn m a -> conn -> m a
 runDbPersist = runReaderT . unDbPersist
