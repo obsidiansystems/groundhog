@@ -98,7 +98,7 @@ import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Control.Monad.Trans.Reader (ReaderT(..), runReaderT, mapReaderT)
 import Control.Monad.Trans.State (StateT)
 import Control.Monad.Reader (MonadReader(..))
-import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, mask, uninterruptibleMask)
+import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, mask, uninterruptibleMask, generalBracket)
 import Control.Monad (liftM)
 import qualified Control.Monad.Cont.Class as Mtl
 import qualified Control.Monad.Error.Class as Mtl
@@ -330,6 +330,8 @@ instance MonadMask m => MonadMask (DbPersist conn m) where
     where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
   uninterruptibleMask a = DbPersist $ ReaderT $ \e -> uninterruptibleMask $ \u -> runReaderT (unDbPersist (a $ q u)) e
     where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
+
+  generalBracket (DbPersist m) f g = DbPersist $ generalBracket m (\a ec -> unDbPersist (f a ec)) (unDbPersist . g)
 
 class PrimitivePersistField (AutoKeyType db) => DbDescriptor db where
   -- | Type of the database default autoincremented key. For example, Sqlite has Int64
