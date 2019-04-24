@@ -87,17 +87,18 @@ module Database.Groundhog.Core
 import Blaze.ByteString.Builder (Builder, fromByteString, toByteString)
 import Control.Applicative (Applicative)
 import Control.Monad.Base (MonadBase (liftBase))
-import Control.Monad.Logger (MonadLogger(..))
+import Control.Monad.Logger (MonadLogger(..), MonadLoggerIO (..))
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class (MonadIO(..))
 import qualified Control.Monad.State as S
 import qualified Control.Monad.State.Strict as Strict
 import Control.Monad.Trans.Control (MonadBaseControl (..), ComposeSt, defaultLiftBaseWith, defaultRestoreM, MonadTransControl (..))
 import Control.Monad.Trans.Maybe (MaybeT(..))
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Control.Monad.Trans.Reader (ReaderT(..), runReaderT, mapReaderT)
 import Control.Monad.Trans.State (StateT)
 import Control.Monad.Reader (MonadReader(..))
-import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, mask, uninterruptibleMask)
+import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, mask, uninterruptibleMask, generalBracket)
 import Control.Monad (liftM)
 import qualified Control.Monad.Cont.Class as Mtl
 import qualified Control.Monad.Error.Class as Mtl
@@ -292,6 +293,9 @@ instance MonadBaseControl IO m => MonadBaseControl IO (DbPersist conn m) where
 instance MonadLogger m => MonadLogger (DbPersist conn m) where
   monadLoggerLog a b c = lift . monadLoggerLog a b c
 
+instance MonadLoggerIO m => MonadLoggerIO (DbPersist conn m) where
+  askLoggerIO = lift askLoggerIO
+
 runDbPersist :: Monad m => DbPersist conn m a -> conn -> m a
 runDbPersist = runReaderT . unDbPersist
 
@@ -326,6 +330,8 @@ instance MonadMask m => MonadMask (DbPersist conn m) where
     where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
   uninterruptibleMask a = DbPersist $ ReaderT $ \e -> uninterruptibleMask $ \u -> runReaderT (unDbPersist (a $ q u)) e
     where q u b = DbPersist $ ReaderT $ \e -> u $ runReaderT (unDbPersist b) e
+
+  generalBracket (DbPersist m) f g = DbPersist $ generalBracket m (\a ec -> unDbPersist (f a ec)) (unDbPersist . g)
 
 class PrimitivePersistField (AutoKeyType db) => DbDescriptor db where
   -- | Type of the database default autoincremented key. For example, Sqlite has Int64
@@ -508,6 +514,34 @@ instance PersistBackend m => PersistBackend (MaybeT m) where
   queryRaw c q p f = do
     ma <- lift $ queryRaw c q p $ \rp -> runMaybeT (f $ lift rp)
     MaybeT (return ma)
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (ExceptT e m) where
+  type PhantomDb (ExceptT e m) = PhantomDb m
+  type TableAnalysis (ExceptT e m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    ma <- lift $ queryRaw c q p $ \rp -> runExceptT (f $ lift rp)
+    ExceptT (return ma)
   insertList = lift . insertList
   getList = lift . getList
 
