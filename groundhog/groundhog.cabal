@@ -35,6 +35,7 @@ library
                    , resourcet                >= 1.1.2
                    , safe-exceptions
                    , transformers-compat      >= 0.3
+                   , writer-cps-mtl
 
     -- See https://prime.haskell.org/wiki/Libraries/Proposals/SemigroupMonoid#Writingcompatiblecode
     if !impl(ghc >= 8.0)

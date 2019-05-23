@@ -14,6 +14,7 @@ module Database.Groundhog.Postgresql
     , distinctOn
     -- other
     , showSqlType
+    , P(..)
     ) where
 
 import Database.Groundhog

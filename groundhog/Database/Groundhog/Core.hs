@@ -104,6 +104,7 @@ import qualified Control.Monad.Cont.Class as Mtl
 import qualified Control.Monad.Error.Class as Mtl
 import qualified Control.Monad.State.Class as Mtl
 import qualified Control.Monad.Writer.Class as Mtl
+import qualified Control.Monad.Writer.CPS as CPSWriter
 import Data.ByteString.Char8 (ByteString)
 import Data.Int (Int64)
 import Data.Map (Map)
@@ -542,6 +543,35 @@ instance PersistBackend m => PersistBackend (ExceptT e m) where
   queryRaw c q p f = do
     ma <- lift $ queryRaw c q p $ \rp -> runExceptT (f $ lift rp)
     ExceptT (return ma)
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance (Monoid w, PersistBackend m) => PersistBackend (CPSWriter.WriterT w m) where
+  type PhantomDb (CPSWriter.WriterT w m) = PhantomDb m
+  type TableAnalysis (CPSWriter.WriterT w m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = do
+    (a, w) <- lift $ queryRaw c q p $ \rp -> CPSWriter.runWriterT (f $ lift rp)
+    CPSWriter.tell w
+    return a
   insertList = lift . insertList
   getList = lift . getList
 
