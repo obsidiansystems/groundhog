@@ -32,6 +32,7 @@ import qualified Database.PostgreSQL.Simple.Internal as PG
 import qualified Database.PostgreSQL.Simple.ToField as PGTF
 import qualified Database.PostgreSQL.Simple.FromField as PGFF
 import qualified Database.PostgreSQL.Simple.Types as PG
+import qualified Database.PostgreSQL.Simple.Transaction as PG
 import Database.PostgreSQL.Simple.Ok (Ok (..))
 import qualified Database.PostgreSQL.LibPQ as LibPQ
 
@@ -194,7 +195,7 @@ instance Savepoint Postgresql where
 
 instance ConnectionManager Postgresql Postgresql where
   withConn f conn@(Postgresql c) = do
-    liftIO $ PG.begin c
+    liftIO $ PG.beginLevel PG.Serializable c
     x <- onException (f conn) (liftIO $ PG.rollback c)
     liftIO $ PG.commit c
     return x
