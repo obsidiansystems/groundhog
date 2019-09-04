@@ -590,8 +590,8 @@ parseDefinitions s = do
         , replicate (Y.yamlColumn mark) ' ' ++ "^"
         ]
       _ -> fail $ show err
-    Right (Left err) -> fail err
-    Right (Right result') -> lift (result' :: PersistDefinitions)
+    Right (_, Left err) -> fail err
+    Right (_, Right result') -> lift (result' :: PersistDefinitions)
 
 defaultMkEntityDecs :: [THEntityDef] -> Q [Dec]
 defaultMkEntityDecs = fmap concat . mapM (\def -> do
