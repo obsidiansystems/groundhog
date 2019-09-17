@@ -94,33 +94,34 @@ data PgTableAnalysis = PgTableAnalysis
   , _pgTableAnalysis_references :: Map QualifiedName (Set (String, ((QualifiedName, String, String), (String, String))))
   } deriving (Eq, Show)
 
-instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (DbPersist Postgresql m) where
+instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackendReadOnly (DbPersist Postgresql m) where
   type PhantomDb (DbPersist Postgresql m) = Postgresql
   type TableAnalysis (DbPersist Postgresql m) = PgTableAnalysis
+  select options = H.select renderConfig queryRaw' preColumns "" options
+  selectAll = H.selectAll renderConfig queryRaw'
+  get k = H.get renderConfig queryRaw' k
+  getBy k = H.getBy renderConfig queryRaw' k
+  count cond = H.count renderConfig queryRaw' cond
+  countAll fakeV = H.countAll renderConfig queryRaw' fakeV
+  project p options = H.project renderConfig queryRaw' preColumns "" p options
+  queryRaw _ query ps f = queryRaw' (fromString query) ps f
+  insertList l = insertList' l
+  getList k = getList' k
+
+instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (DbPersist Postgresql m) where
   insert v = insert' v
   insert_ v = insert_' v
   insertBy u v = H.insertBy renderConfig queryRaw' True u v
   insertByAll v = H.insertByAll renderConfig queryRaw' True v
   replace k v = H.replace renderConfig queryRaw' executeRaw' (insertIntoConstructorTable False) k v
   replaceBy k v = H.replaceBy renderConfig executeRaw' k v
-  select options = H.select renderConfig queryRaw' preColumns "" options
-  selectAll = H.selectAll renderConfig queryRaw'
-  get k = H.get renderConfig queryRaw' k
-  getBy k = H.getBy renderConfig queryRaw' k
   update upds cond = H.update renderConfig executeRaw' upds cond
   delete cond = H.delete renderConfig executeRaw' cond
   deleteBy k = H.deleteBy renderConfig executeRaw' k
   deleteAll v = H.deleteAll renderConfig executeRaw' v
-  count cond = H.count renderConfig queryRaw' cond
-  countAll fakeV = H.countAll renderConfig queryRaw' fakeV
-  project p options = H.project renderConfig queryRaw' preColumns "" p options
   migrate tableInfo fakeV = migrate' tableInfo fakeV
-
   executeRaw _ query ps = executeRaw' (fromString query) ps
-  queryRaw _ query ps f = queryRaw' (fromString query) ps f
 
-  insertList l = insertList' l
-  getList k = getList' k
 
 instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => SchemaAnalyzer (DbPersist Postgresql m) where
   schemaExists schema = queryRaw' "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=?" [toPrimitivePersistValue proxy schema] (fmap isJust)

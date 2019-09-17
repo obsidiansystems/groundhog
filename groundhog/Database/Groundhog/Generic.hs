@@ -2,7 +2,7 @@
 
 -- | This helper module is intended for use by the backend creators
 module Database.Groundhog.Generic
-  ( 
+  (
   -- * Migration
     createMigration
   , executeMigration
@@ -205,10 +205,10 @@ applyReferencesSettings (Just (parent, onDel, onUpd)) (Just (parent', onDel', on
 applyReferencesSettings (Just (Just parent, onDel, onUpd)) Nothing = Just (Right parent, onDel, onUpd)
 applyReferencesSettings _ Nothing = error $ "applyReferencesSettings: expected type with reference, got Nothing"
 
-primToPersistValue :: (PersistBackend m, PrimitivePersistField a) => a -> m ([PersistValue] -> [PersistValue])
+primToPersistValue :: (PersistBackendReadOnly m, PrimitivePersistField a) => a -> m ([PersistValue] -> [PersistValue])
 primToPersistValue a = phantomDb >>= \p -> return (toPrimitivePersistValue p a:)
 
-primFromPersistValue :: (PersistBackend m, PrimitivePersistField a) => [PersistValue] -> m (a, [PersistValue])
+primFromPersistValue :: (PersistBackendReadOnly m, PrimitivePersistField a) => [PersistValue] -> m (a, [PersistValue])
 primFromPersistValue (x:xs) = phantomDb >>= \p -> return (fromPrimitivePersistValue p x, xs)
 primFromPersistValue xs = (\a -> fail (failMessage a xs) >> return (a, xs)) undefined
 
@@ -219,22 +219,22 @@ primFromPurePersistValues :: (DbDescriptor db, PrimitivePersistField a) => proxy
 primFromPurePersistValues p (x:xs) = (fromPrimitivePersistValue p x, xs)
 primFromPurePersistValues _ xs = (\a -> error (failMessage a xs) `asTypeOf` (a, xs)) undefined
 
-primToSinglePersistValue :: (PersistBackend m, PrimitivePersistField a) => a -> m PersistValue
+primToSinglePersistValue :: (PersistBackendReadOnly m, PrimitivePersistField a) => a -> m PersistValue
 primToSinglePersistValue a = phantomDb >>= \p -> return (toPrimitivePersistValue p a)
 
-primFromSinglePersistValue :: (PersistBackend m, PrimitivePersistField a) => PersistValue -> m a
+primFromSinglePersistValue :: (PersistBackendReadOnly m, PrimitivePersistField a) => PersistValue -> m a
 primFromSinglePersistValue a = phantomDb >>= \p -> return (fromPrimitivePersistValue p a)
 
-pureToPersistValue :: (PersistBackend m, PurePersistField a) => a -> m ([PersistValue] -> [PersistValue])
+pureToPersistValue :: (PersistBackendReadOnly m, PurePersistField a) => a -> m ([PersistValue] -> [PersistValue])
 pureToPersistValue a = phantomDb >>= \p -> return (toPurePersistValues p a)
 
-pureFromPersistValue :: (PersistBackend m, PurePersistField a) => [PersistValue] -> m (a, [PersistValue])
+pureFromPersistValue :: (PersistBackendReadOnly m, PurePersistField a) => [PersistValue] -> m (a, [PersistValue])
 pureFromPersistValue xs = phantomDb >>= \p -> return (fromPurePersistValues p xs)
 
 singleToPersistValue :: (PersistBackend m, SinglePersistField a) => a -> m ([PersistValue] -> [PersistValue])
 singleToPersistValue a = toSinglePersistValue a >>= \x -> return (x:)
 
-singleFromPersistValue :: (PersistBackend m, SinglePersistField a) => [PersistValue] -> m (a, [PersistValue])
+singleFromPersistValue :: (PersistBackendReadOnly m, SinglePersistField a) => [PersistValue] -> m (a, [PersistValue])
 singleFromPersistValue (x:xs) = fromSinglePersistValue x >>= \a -> return (a, xs)
 singleFromPersistValue xs = (\a -> fail (failMessage a xs) >> return (a, xs)) undefined
 
@@ -242,7 +242,7 @@ toSinglePersistValueUnique :: forall m v u . (PersistBackend m, PersistEntity v,
                            => u (UniqueMarker v) -> v -> m PersistValue
 toSinglePersistValueUnique u v = insertBy u v >> primToSinglePersistValue (extractUnique v :: Key v (Unique u))
 
-fromSinglePersistValueUnique :: forall m v u . (PersistBackend m, PersistEntity v, IsUniqueKey (Key v (Unique u)), PrimitivePersistField (Key v (Unique u)))
+fromSinglePersistValueUnique :: forall m v u . (PersistBackendReadOnly m, PersistEntity v, IsUniqueKey (Key v (Unique u)), PrimitivePersistField (Key v (Unique u)))
                              => u (UniqueMarker v) -> PersistValue -> m v
 fromSinglePersistValueUnique _ x = phantomDb >>= \proxy -> getBy (fromPrimitivePersistValue proxy x :: Key v (Unique u)) >>= maybe (fail $ "No data with id " ++ show x) return
 
@@ -250,7 +250,7 @@ toPersistValuesUnique :: forall m v u . (PersistBackend m, PersistEntity v, IsUn
                       => u (UniqueMarker v) -> v -> m ([PersistValue] -> [PersistValue])
 toPersistValuesUnique u v = insertBy u v >> toPersistValues (extractUnique v :: Key v (Unique u))
 
-fromPersistValuesUnique :: forall m v u . (PersistBackend m, PersistEntity v, IsUniqueKey (Key v (Unique u)))
+fromPersistValuesUnique :: forall m v u . (PersistBackendReadOnly m, PersistEntity v, IsUniqueKey (Key v (Unique u)))
                         => u (UniqueMarker v) -> [PersistValue] -> m (v, [PersistValue])
 fromPersistValuesUnique _ xs = fromPersistValues xs >>= \(k, xs') -> getBy (k :: Key v (Unique u)) >>= maybe (fail $ "No data with id " ++ show xs) (\v -> return (v, xs'))
 
@@ -258,7 +258,7 @@ toSinglePersistValueAutoKey :: forall m v . (PersistBackend m, PersistEntity v, 
                             => v -> m PersistValue
 toSinglePersistValueAutoKey a = insertByAll a >>= primToSinglePersistValue . either id id
 
-fromSinglePersistValueAutoKey :: forall m v . (PersistBackend m, PersistEntity v, PrimitivePersistField (Key v BackendSpecific))
+fromSinglePersistValueAutoKey :: forall m v . (PersistBackendReadOnly m, PersistEntity v, PrimitivePersistField (Key v BackendSpecific))
                               => PersistValue -> m v
 fromSinglePersistValueAutoKey x = phantomDb >>= \p -> get (fromPrimitivePersistValue p x :: Key v BackendSpecific) >>= maybe (fail $ "No data with id " ++ show x) return
 
@@ -292,7 +292,7 @@ mapAllRows :: Monad m => ([PersistValue] -> m a) -> RowPopper m -> m [a]
 mapAllRows f pop = go where
   go = pop >>= maybe (return []) (f >=> \a -> liftM (a:) go)
 
-phantomDb :: PersistBackend m => m (proxy (PhantomDb m))
+phantomDb :: PersistBackendReadOnly m => m (proxy (PhantomDb m))
 phantomDb = return $ error "phantomDb"
 
 getAutoKeyType :: DbDescriptor db => proxy db -> DbTypePrimitive
