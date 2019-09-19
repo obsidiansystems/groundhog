@@ -87,7 +87,7 @@ module Database.Groundhog.Core
 import Blaze.ByteString.Builder (Builder, fromByteString, toByteString)
 import Control.Applicative (Applicative)
 import Control.Monad.Base (MonadBase (liftBase))
-import Control.Monad.Logger (MonadLogger(..), MonadLoggerIO (..))
+import Control.Monad.Logger (MonadLogger(..), MonadLoggerIO (..), NoLoggingT, runNoLoggingT)
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class (MonadIO(..))
 import qualified Control.Monad.State as S
@@ -572,6 +572,32 @@ instance (Monoid w, PersistBackend m) => PersistBackend (CPSWriter.WriterT w m) 
     (a, w) <- lift $ queryRaw c q p $ \rp -> CPSWriter.runWriterT (f $ lift rp)
     CPSWriter.tell w
     return a
+  insertList = lift . insertList
+  getList = lift . getList
+
+instance PersistBackend m => PersistBackend (NoLoggingT m) where
+  type PhantomDb (NoLoggingT m) = PhantomDb m
+  type TableAnalysis (NoLoggingT m) = TableAnalysis m
+  insert = lift . insert
+  insert_ = lift . insert_
+  insertBy u v = lift $ insertBy u v
+  insertByAll = lift . insertByAll
+  replace k v = lift $ replace k v
+  replaceBy u v = lift $ replaceBy u v
+  select = lift . select
+  selectAll = lift selectAll
+  get = lift . get
+  getBy = lift . getBy
+  update us c = lift $ update us c
+  delete = lift . delete
+  deleteBy = lift . deleteBy
+  deleteAll = lift . deleteAll
+  count = lift . count
+  countAll = lift . countAll
+  project p o = lift $ project p o
+  migrate i v = S.mapStateT lift $ migrate i v
+  executeRaw c q p = lift $ executeRaw c q p
+  queryRaw c q p f = lift $ queryRaw c q p $ \rp -> runNoLoggingT (f $ lift rp)
   insertList = lift . insertList
   getList = lift . getList
 
