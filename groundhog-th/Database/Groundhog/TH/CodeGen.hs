@@ -781,10 +781,10 @@ isPrim (AppT (ConT tcon) t) | tcon == ''Maybe = isPrim t
 isPrim _ = return False
 
 foldType :: (Type -> a) -> (a -> a -> a) -> Type -> a
-foldType f (<>) = go where
+foldType f (<+>) = go where
   go (ForallT _ _ _) = error "forall'ed fields are not allowed"
-  go z@(AppT a b)    = f z <> go a <> go b
-  go z@(SigT t _)    = f z <> go t
+  go z@(AppT a b)    = f z <+> go a <+> go b
+  go z@(SigT t _)    = f z <+> go t
   go z               = f z
 
 hasFreeVars :: Type -> Bool
