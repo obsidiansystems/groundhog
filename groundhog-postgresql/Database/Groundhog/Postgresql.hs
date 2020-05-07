@@ -36,7 +36,7 @@ import Database.PostgreSQL.Simple.Ok (Ok (..))
 import qualified Database.PostgreSQL.LibPQ as LibPQ
 
 import Control.Arrow ((***), second)
-import Control.Exception (throw)
+import Control.Exception (throw, throwIO)
 import Control.Monad (forM, liftM, liftM2, (>=>))
 import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Logger (MonadLogger, logDebugS)
@@ -769,20 +769,13 @@ queryRaw' query vals f = do
     case mret of
       Nothing -> do
         merr <- LibPQ.errorMessage rawconn
-        fail $ case merr of
-                 Nothing -> "Postgresql.withStmt': unknown error"
-                 Just e  -> "Postgresql.withStmt': " ++ unpack e
+        throwIO $ PG.fatalError $ maybe "queryRaw' failed for unknown reason" id merr
       Just ret -> do
         -- Check result status
         status <- LibPQ.resultStatus ret
         case status of
           LibPQ.TuplesOk -> return ()
-          _ -> do
-            msg <- LibPQ.resStatus status
-            merr <- LibPQ.errorMessage rawconn
-            fail $ "Postgresql.withStmt': bad result status " ++
-                   show status ++ " (" ++ show msg ++ ")" ++
-                   maybe "" ((". Error message: " ++) . unpack) merr
+          _ -> PG.throwResultError "" ret status
 
         -- Get number and type of columns
         cols <- LibPQ.nfields ret
