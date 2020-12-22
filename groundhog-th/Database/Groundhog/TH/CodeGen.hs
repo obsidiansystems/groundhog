@@ -319,7 +319,7 @@ mkUniqueKeysPrimitiveOrPurePersistFieldInstances def = do
         fromPrim' <- funD 'fromPrimitivePersistValue [clause [varP proxy, varP x] (normalB [| $(conE conName) (fromPrimitivePersistValue $(varE proxy) $(varE x)) |]) []]
         let decs = [toPrim', fromPrim']
         sequence [ return $ InstanceD Nothing context (AppT (ConT ''PrimitivePersistField) uniqKeyType) decs
-                 , return $ InstanceD Nothing context (AppT (ConT ''NeverNull) uniqKeyType) decs
+                 , return $ InstanceD Nothing context (AppT (ConT ''NeverNull) uniqKeyType) []
                  , mkDefaultPurePersistFieldInstance context uniqKeyType
                  , mkDefaultSinglePersistFieldInstance context uniqKeyType]
       else mkPurePersistFieldInstance uniqKeyType conName (thUniqueKeyFields unique) context
