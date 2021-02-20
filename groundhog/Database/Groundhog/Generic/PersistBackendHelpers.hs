@@ -2,7 +2,7 @@
 
 -- | This helper module contains generic versions of PersistBackend functions
 module Database.Groundhog.Generic.PersistBackendHelpers
-  ( 
+  (
     get
   , select
   , selectAll
@@ -20,8 +20,8 @@ module Database.Groundhog.Generic.PersistBackendHelpers
   , insertBy
   ) where
 
-import Database.Groundhog.Core hiding (PersistBackend(..))
-import Database.Groundhog.Core (PersistBackend, PhantomDb)
+import Database.Groundhog.Core hiding (PersistBackend(..), PersistBackendReadOnly(..))
+import Database.Groundhog.Core (PersistBackend, PersistBackendReadOnly, PhantomDb)
 import qualified Database.Groundhog.Core as Core
 import Database.Groundhog.Generic
 import Database.Groundhog.Generic.Sql
@@ -32,7 +32,7 @@ import Data.Maybe (catMaybes, fromJust, mapMaybe)
 import Data.Monoid hiding ((<>))
 
 {-# INLINABLE get #-}
-get :: forall m v . (PersistBackend m, PersistEntity v, PrimitivePersistField (Key v BackendSpecific))
+get :: forall m v . (PersistBackendReadOnly m, PersistEntity v, PrimitivePersistField (Key v BackendSpecific))
     => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> Key v BackendSpecific -> m (Maybe v)
 get RenderConfig{..} queryFunc (k :: Key v BackendSpecific) = do
   let e = entityDef proxy (undefined :: v)
@@ -62,7 +62,7 @@ get RenderConfig{..} queryFunc (k :: Key v BackendSpecific) = do
         Just x' -> fail $ "Unexpected number of columns returned: " ++ show x'
         Nothing -> return Nothing
 
-select :: forall m db r v c opts . (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackend m, PersistEntity v, EntityConstr v c, HasSelectOptions opts db r)
+select :: forall m db r v c opts . (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackendReadOnly m, PersistEntity v, EntityConstr v c, HasSelectOptions opts db r)
        => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> (opts -> RenderS db r) -> Utf8 -> opts -> m [v]
 select conf@RenderConfig{..} queryFunc preColumns noLimit options = doSelectQuery where
   SelectOptions cond limit offset ords dist _ = getSelectOptions options
@@ -84,7 +84,7 @@ select conf@RenderConfig{..} queryFunc preColumns noLimit options = doSelectQuer
   cNum = entityConstrNum (undefined :: proxy v) (undefined :: c a)
   constr = constructors e !! cNum
 
-selectAll :: forall m v . (PersistBackend m, PersistEntity v)
+selectAll :: forall m v . (PersistBackendReadOnly m, PersistEntity v)
           => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> m [(AutoKey v, v)]
 selectAll RenderConfig{..} queryFunc = start where
   start = if isSimple (constructors e)
@@ -100,7 +100,7 @@ selectAll RenderConfig{..} queryFunc = start where
   e = entityDef proxy (undefined :: v)
   proxy = undefined :: proxy (PhantomDb m)
 
-getBy :: forall m v u . (PersistBackend m, PersistEntity v, IsUniqueKey (Key v (Unique u)))
+getBy :: forall m v u . (PersistBackendReadOnly m, PersistEntity v, IsUniqueKey (Key v (Unique u)))
       => RenderConfig
       -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -- ^ function to run query
       -> Key v (Unique u)
@@ -120,7 +120,7 @@ getBy conf@RenderConfig{..} queryFunc (k :: Key v (Unique u)) = do
     Just xs -> liftM (Just . fst) $ fromEntityPersistValues $ PersistInt64 0:xs
     Nothing -> return Nothing
 
-project :: forall m db r v c p opts a'. (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackend m, PersistEntity v, EntityConstr v c, Projection p a', ProjectionDb p db, ProjectionRestriction p r, HasSelectOptions opts db r)
+project :: forall m db r v c p opts a'. (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackendReadOnly m, PersistEntity v, EntityConstr v c, Projection p a', ProjectionDb p db, ProjectionRestriction p r, HasSelectOptions opts db r)
         => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> (opts -> RenderS db r) -> Utf8 -> p -> opts -> m [a']
 project conf@RenderConfig{..} queryFunc preColumns noLimit p options = doSelectQuery where
   SelectOptions cond limit offset ords dist _ = getSelectOptions options
@@ -141,7 +141,7 @@ project conf@RenderConfig{..} queryFunc preColumns noLimit p options = doSelectQ
   doSelectQuery = queryFunc query (binds []) $ mapAllRows $ liftM fst . projectionResult p
   constr = constructors e !! entityConstrNum (undefined :: proxy v) (undefined :: c a)
 
-count :: forall m db r v c . (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackend m, PersistEntity v, EntityConstr v c)
+count :: forall m db r v c . (SqlDb db, db ~ PhantomDb m, r ~ RestrictionHolder v c, PersistBackendReadOnly m, PersistEntity v, EntityConstr v c)
       => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> Cond db r -> m Int
 count conf@RenderConfig{..} queryFunc cond = do
   let e = entityDef proxy (undefined :: v)
@@ -288,7 +288,7 @@ deleteAll RenderConfig{..} execFunc (_ :: v) = execFunc query [] where
   proxy = undefined :: proxy (PhantomDb m)
   query = "DELETE FROM " <> mainTableName esc e
 
-countAll :: forall m v . (PersistBackend m, PersistEntity v)
+countAll :: forall m v . (PersistBackendReadOnly m, PersistEntity v)
          => RenderConfig -> (forall a . Utf8 -> [PersistValue] -> (RowPopper m -> m a) -> m a) -> v -> m Int
 countAll RenderConfig{..} queryFunc (_ :: v) = do
   let e = entityDef proxy (undefined :: v)
@@ -329,11 +329,11 @@ constrId :: (Utf8 -> Utf8) -> ConstructorDef -> Maybe Utf8
 constrId escape = fmap (escape . fromString) . constrAutoKeyName
 
 -- | receives constructor number and row of values from the constructor table
-mkEntity :: (PersistEntity v, PersistBackend m) => proxy (PhantomDb m) -> Int -> [PersistValue] -> m (AutoKey v, v)
+mkEntity :: (PersistEntity v, PersistBackendReadOnly m) => proxy (PhantomDb m) -> Int -> [PersistValue] -> m (AutoKey v, v)
 mkEntity proxy i xs = fromEntityPersistValues (toPrimitivePersistValue proxy i:xs') >>= \(v, _) -> return (k, v) where
   (k, xs') = fromPurePersistValues proxy xs
 
-toEntityPersistValues' :: (PersistBackend m, PersistEntity v) => v -> m [PersistValue]
+toEntityPersistValues' :: (PersistBackendReadOnly m, PersistEntity v) => v -> m [PersistValue]
 toEntityPersistValues' = liftM ($ []) . toEntityPersistValues
 
 mkUniqueCond :: [Utf8] -> ([PersistValue] -> [PersistValue]) -> [RenderS db r]
